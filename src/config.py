@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     )
     tastytrade_cert_username: str = Field(default="")
     tastytrade_cert_password: str = Field(default="")
+    tastytrade_cert_account: str = Field(default="")
+    tastytrade_streamer_url: str = Field(
+        default="wss://streamer.cert.tastyworks.com",
+        description="MUST contain 'cert' (sandbox streamer).",
+    )
 
     # LLM API keys
     anthropic_api_key: str = Field(default="")
@@ -104,6 +109,9 @@ def assert_safety_posture(settings: Settings) -> None:
     assert "demo" in settings.tradovate_base_url.lower(), (
         f"Refusing to start: Tradovate URL is not demo "
         f"({settings.tradovate_base_url!r})."
+    )
+    assert "cert" in settings.tastytrade_streamer_url.lower(), (
+        f"Refusing: Tastytrade streamer must be sandbox/cert ({settings.tastytrade_streamer_url!r})"
     )
     assert "cert" in settings.tastytrade_base_url.lower(), (
         f"Refusing: Tastytrade URL must be sandbox/cert ({settings.tastytrade_base_url!r})"
