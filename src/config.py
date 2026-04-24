@@ -75,6 +75,14 @@ class Settings(BaseSettings):
         description="Must contain 'demo'. Asserted at startup.",
     )
 
+    # Tastytrade certification credentials (primary broker)
+    tastytrade_base_url: str = Field(
+        default="https://api.cert.tastyworks.com",
+        description="MUST contain 'cert' or be on the SANDBOX_HOSTS allowlist.",
+    )
+    tastytrade_cert_username: str = Field(default="")
+    tastytrade_cert_password: str = Field(default="")
+
     # LLM API keys
     anthropic_api_key: str = Field(default="")
     google_api_key: str = Field(default="")
@@ -96,6 +104,9 @@ def assert_safety_posture(settings: Settings) -> None:
     assert "demo" in settings.tradovate_base_url.lower(), (
         f"Refusing to start: Tradovate URL is not demo "
         f"({settings.tradovate_base_url!r})."
+    )
+    assert "cert" in settings.tastytrade_base_url.lower(), (
+        f"Refusing: Tastytrade URL must be sandbox/cert ({settings.tastytrade_base_url!r})"
     )
     assert MANDATORY_STOP_LOSS is True
     assert NO_AVERAGING_DOWN is True
