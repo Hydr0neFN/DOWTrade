@@ -1,0 +1,18 @@
+[Unit]
+Description=DOWTrade paper-trading bot (dashboard + daily journal scheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/DOWTrade/trading-bot
+EnvironmentFile=/root/DOWTrade/trading-bot/.env
+ExecStart=/root/DOWTrade/trading-bot/.venv/bin/python3 -m src.main
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/root/DOWTrade/trading-bot/logs/dowtrade.log
+StandardError=append:/root/DOWTrade/trading-bot/logs/dowtrade.err
+
+[Install]
+WantedBy=multi-user.target
