@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h3>Current Position</h3>
+    <p id="pos-qty">Qty: {{ position.qty }}</p>
+    <p id="pos-side">Side: {{ position.side }}</p>
+    <p id="pos-avg">Avg Price: {{ position.avg_price }}</p>
+    <p id="pos-unrealized">Unrealized PnL: {{ position.unrealized }}</p>
+    <p id="pos-realized">Today Realized: {{ today_realized }}</p>
+</div>
+<div class="card">
+    <h3>Last 3 Decisions</h3>
+    {% for d in decisions %}
+        <div>
+            <b>{{ d.bar_ts }}</b>: {{ d.direction }} (Confidence: {{ d.confidence }})
+            <ul>
+            {% for call in d.llm_calls %}
+                <li><i>{{ call.model }}</i>: {{ call.raw_response[:100] }}...</li>
+            {% endfor %}
+            </ul>
+        </div>
+    {% endfor %}
+</div>
+{% endblock %}

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DOWTrade</title>
+    <style>
+        body { background: #121212; color: #e0e0e0; font-family: monospace; padding: 20px; }
+        a { color: #bb86fc; }
+        .nav { padding: 10px; background: #1e1e1e; margin-bottom: 20px; }
+        .nav a { margin-right: 15px; }
+        .card { background: #1e1e1e; padding: 15px; margin-bottom: 15px; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="/static/app.js" defer></script>
+</head>
+<body>
+    <div class="nav">
+        <a href="/">Home</a>
+        <a href="/equity">Equity</a>
+        <a href="/trades">Trades</a>
+        <a href="/journal">Journal</a>
+        <a href="/disagreements">Disagreements</a>
+    </div>
+    <div id="content">
+        {% block content %}{% endblock %}
+    </div>
+</body>
+</html>
