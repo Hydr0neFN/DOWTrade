@@ -277,20 +277,6 @@ class TestSubmitBracketOrder:
 # fetch_historical_bars() raises NotImplementedError
 # ---------------------------------------------------------------------------
 
-class TestFetchHistoricalBars:
-
-    def test_raises_not_implemented(self, cert_settings):
-        """fetch_historical_bars must raise NotImplementedError mentioning Phase 6."""
-        with patch("httpx.Client") as mock_cls:
-            mock_client = _make_mock_client()
-            mock_cls.return_value = mock_client
-
-            broker = TastytradeBroker(cert_settings)
-            with pytest.raises(NotImplementedError) as exc_info:
-                broker.fetch_historical_bars("MYM", 0, 1, 15)
-
-            assert "Phase 6" in str(exc_info.value)
-
 
 # ---------------------------------------------------------------------------
 # get_position() with no matching symbol

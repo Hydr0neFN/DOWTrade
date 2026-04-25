@@ -61,16 +61,12 @@ def _redact(text: str, *secrets: str) -> str:
     return text
 
 
+
 def _current_front_month_code(now: Optional[datetime] = None) -> str:
     """
     Return the approximate front-month letter+year-digit for MYM.
     MYM front-months roll quarterly: Mar(H), Jun(M), Sep(U), Dec(Z).
-    We advance to the next quarterly month after the 15th of expiry month.
-
-    NOTE: This is a heuristic. A production implementation should query
-    the Tastytrade instrument search to get the exact active symbol.
-    TODO(Phase 5): Replace with live symbol lookup via
-      GET /instruments/futures?product-code=MYM&active=true
+    We advance to the next quarterly month after the 3rd Friday of expiry month.
     """
     if now is None:
         now = datetime.now(_ET)
@@ -78,16 +74,31 @@ def _current_front_month_code(now: Optional[datetime] = None) -> str:
     month = now.month
     day = now.day
 
+    import calendar
+    c = calendar.Calendar(firstweekday=calendar.SUNDAY)
+    monthcal = c.monthdatescalendar(year, month)
+    fridays = [d for week in monthcal for d in week if d.weekday() == calendar.FRIDAY and d.month == month]
+    third_friday = fridays[2] if len(fridays) >= 3 else now.date()
+    
+    roll = False
+    if day > third_friday.day:
+        roll = True
+
     quarterly = [3, 6, 9, 12]
-
+    target_q = None
+    target_year = year
     for q in quarterly:
-        if month == q and day > 15:
-            continue
-        if month <= q:
-            return _MONTH_CODES[q] + str(year % 10)
+        if month < q or (month == q and not roll):
+            target_q = q
+            break
+    if target_q is None:
+        target_q = 3
+        target_year += 1
 
-    # Wrapped to next year March
-    return "H" + str((year + 1) % 10)
+    return _MONTH_CODES[target_q] + str(target_year % 10)
+
+def dxfeed_symbol(root: str, now: Optional[datetime] = None) -> str:
+    return to_tastytrade_symbol(root, now) + ":XCME"
 
 
 def to_tastytrade_symbol(root: str, now: Optional[datetime] = None) -> str:
@@ -498,6 +509,17 @@ class TastytradeBroker(Broker):
 
         return Position(side="flat", qty=0, avg_price=0.0, unrealized_pnl=0.0, pyramid_adds_used=0)
 
+
+    def get_dxlink_token(self) -> dict:
+        """GET /api-quote-tokens with the session token. Returns {token, dxlink-url, level}."""
+        resp = self._request("GET", "/api-quote-tokens")
+        data = resp.json().get("data", {})
+        return {
+            "token": data.get("token", ""),
+            "dxlink-url": data.get("dxlink-url", ""),
+            "level": data.get("level", "")
+        }
+
     def fetch_historical_bars(
         self,
         symbol: str,
@@ -505,25 +527,66 @@ class TastytradeBroker(Broker):
         end_ts: int,
         timeframe_min: int = 15,
     ) -> list[Bar]:
-        """
-        Raise NotImplementedError -- historical bars via dxLink are Phase 6.
+        import asyncio
+        from src.live.dxlink import DxLinkStreamer
+        
+        token_data = self.get_dxlink_token()
+        dxlink_url = token_data.get("dxlink-url", "")
+        dxlink_token = token_data.get("token", "")
+        
+        bars = []
+        
+        def on_candle(sym: str, candle: dict):
+            ts = candle.get("time", 0) // 1000
+            if start_ts <= ts <= end_ts:
 
-        Phase 6 implementation path:
-          1. GET /api-quote-tokens -> returns dxlink-url and short-lived token.
-          2. Establish dxLink WebSocket connection to that URL.
-          3. Send FEED_SETUP and SUBSCRIPTION messages to subscribe to
-             CANDLE events for to_tastytrade_symbol(symbol) with
-             period = f"{timeframe_min}m".
-          4. Collect incoming CANDLE event objects:
-             {eventType: Candle, eventSymbol: ..., time: <ms>,
-              open: float, high: float, low: float, close: float, volume: float}
-          5. Filter events where time/1000 is in [start_ts, end_ts].
-          6. Convert each event to Bar(ts_utc=time//1000, open=..., ...).
-          7. Return sorted by ts_utc ascending.
-          Reference: https://demo.dxfeed.com/dxlink-ws  (dxLink protocol docs)
-          Tastytrade-specific: https://developer.tastytrade.com/streaming-market-data/
-        """
-        raise NotImplementedError(
-            f"[{BROKER_NAME}] fetch_historical_bars: Historical bars via "
-            "dxLink CANDLE -- Phase 6. See docstring for implementation path."
-        )
+                vol_raw = candle.get("volume", 0)
+                try:
+                    vol_f = float(vol_raw)
+                    import math
+                    vol_int = 0 if math.isnan(vol_f) else int(vol_f)
+                except (ValueError, TypeError):
+                    vol_int = 0
+                
+                bars.append(Bar(
+                    ts_utc=ts,
+                    open=candle.get("open", 0.0),
+                    high=candle.get("high", 0.0),
+                    low=candle.get("low", 0.0),
+                    close=candle.get("close", 0.0),
+                    volume=vol_int
+                ))
+
+        async def run_fetch():
+            streamer = DxLinkStreamer(dxlink_url, dxlink_token, on_candle)
+            await streamer.connect()
+            period_str = f"{timeframe_min}m"
+            target_sym = dxfeed_symbol(symbol) + f"{{={period_str}}}"
+            await streamer.subscribe_candles(target_sym, period_str, from_time_ms=start_ts * 1000)
+            
+            run_task = asyncio.create_task(streamer.run())
+            
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                if bars and bars[-1].ts_utc >= end_ts:
+                    break
+            
+            await streamer.close()
+            try:
+                await run_task
+            except Exception:
+                pass
+            
+        import threading
+        def _run_in_thread():
+            asyncio.run(run_fetch())
+        t = threading.Thread(target=_run_in_thread)
+        t.start()
+        t.join()
+        
+        unique_bars = {}
+        for b in bars:
+            unique_bars[b.ts_utc] = b
+        res = list(unique_bars.values())
+        res.sort(key=lambda b: b.ts_utc)
+        return res
