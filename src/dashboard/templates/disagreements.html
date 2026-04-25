@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h3>Disagreements</h3>
+    <ul>
+    {% for d in decisions %}
+        <li><b>{{ d.bar_ts }}</b>: {{ d.raw_votes }}</li>
+    {% endfor %}
+    </ul>
+</div>
+{% endblock %}

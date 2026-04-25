@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <canvas id="equityChart"></canvas>
+</div>
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+    fetch('/api/equity').then(r => r.json()).then(data => {
+        const ctx = document.getElementById('equityChart').getContext('2d');
+        new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: data.map(d => d.ts),
+                datasets: [{
+                    label: 'Equity',
+                    data: data.map(d => d.balance),
+                    borderColor: '#bb86fc',
+                    tension: 0.1
+                }]
+            }
+        });
+    });
+});
+</script>
+{% endblock %}
