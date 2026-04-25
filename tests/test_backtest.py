@@ -34,6 +34,7 @@ REQUIRED_STAT_KEYS = {
     "max_drawdown_pct",
     "bars_processed",
     "elapsed_sec",
+    "total_llm_cost_usd",
 }
 
 
@@ -314,13 +315,51 @@ def test_stat_keys():
 
 
 # ---------------------------------------------------------------------------
-# Test 9: live-llm mode raises NotImplementedError
+# Test 9: live-llm mode is now wired (no longer raises NotImplementedError).
+# Smoke-test it with mocked LLM clients so no real API calls are made.
 # ---------------------------------------------------------------------------
 
-def test_live_llm_raises():
-    cfg = BacktestConfig(
-        csv_path=SYNTHETIC_CSV,
-        mode="live-llm",
-    )
-    with pytest.raises(NotImplementedError):
-        run_backtest(cfg)
+def test_live_llm_stat_keys():
+    """live-llm mode must return stats with total_llm_cost_usd key."""
+    from unittest.mock import MagicMock, patch
+    from src.llm.base import LLMCallResult
+    # Build a minimal safe LLMCallResult returned by every evaluate() call
+    def _haiku_result(*args, **kwargs):
+        return LLMCallResult(
+            parsed={"trend": "sideways", "last_confirmed_hh": None,
+                    "last_confirmed_hl": None, "pattern_intact": True,
+                    "structural_signal": "none", "confidence_0_to_1": 0.5,
+                    "reasoning": "mocked"},
+            raw_response="{}", latency_ms=1, input_tokens=10, output_tokens=10,
+            cost_usd=0.001, error=None, used_fallback=False, model_used="mock-haiku",
+        )
+    def _gemini_result(*args, **kwargs):
+        return LLMCallResult(
+            parsed={"action": "hold", "stop_price": 0.0,
+                    "trailing_stop_atr_multiple": 2.0, "reasoning": "mocked"},
+            raw_response="{}", latency_ms=1, input_tokens=10, output_tokens=10,
+            cost_usd=0.001, error=None, used_fallback=False, model_used="mock-gemini",
+        )
+    def _deepseek_result(*args, **kwargs):
+        return LLMCallResult(
+            parsed={"approved": False, "violations": [], "override_action": None,
+                    "reasoning": "mocked"},
+            raw_response="{}", latency_ms=1, input_tokens=10, output_tokens=10,
+            cost_usd=0.001, error=None, used_fallback=False, model_used="mock-deepseek",
+        )
+    small_cfg = SyntheticConfig(start_date=date(2025, 1, 6), num_days=1, seed=42)
+    small_bars = generate_bars(small_cfg)
+    csv_path = _make_temp_csv(small_bars)
+    try:
+        with patch("src.llm.haiku_structural.HaikuStructural.__init__", return_value=None),              patch("src.llm.haiku_structural.HaikuStructural.evaluate", side_effect=_haiku_result),              patch("src.llm.gemini_execution.GeminiExecution.__init__", return_value=None),              patch("src.llm.gemini_execution.GeminiExecution.evaluate", side_effect=_gemini_result),              patch("src.llm.deepseek_risk.DeepSeekRisk.__init__", return_value=None),              patch("src.llm.deepseek_risk.DeepSeekRisk.evaluate", side_effect=_deepseek_result),              patch("src.config.Settings"):
+            cfg = BacktestConfig(
+                csv_path=csv_path,
+                mode="live-llm",
+                db_path=":memory:",
+                warmup_bars=50,
+            )
+            result = run_backtest(cfg)
+        assert "total_llm_cost_usd" in result.stats, "missing total_llm_cost_usd"
+        assert result.stats["total_llm_cost_usd"] >= 0.0
+    finally:
+        import os; os.unlink(csv_path)
