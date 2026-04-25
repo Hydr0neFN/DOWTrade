@@ -2,8 +2,7 @@
 src/backtest/harness.py
 =======================
 Backtest harness: replays historical 15-min MYM bars through the full
-decision pipeline.  Pure (no live API calls).  --mode live-llm raises
-NotImplementedError.
+decision pipeline.  Supports stub and live-llm mode (real LLM calls).
 """
 from __future__ import annotations
 
@@ -104,9 +103,6 @@ def _session_date_key(ts: int) -> str:
 # ---------------------------------------------------------------------------
 
 def run_backtest(cfg: BacktestConfig) -> BacktestResult:
-    if cfg.mode == "live-llm":
-        raise NotImplementedError("live-llm mode is not implemented yet")
-
     t0 = _time_mod.monotonic()
 
     all_bars: List[Bar] = read_csv(cfg.csv_path)
@@ -130,6 +126,26 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
     gemini_stub = StubGemini()
     deepseek_stub = StubDeepSeek()
     _decision_seq: int = 0
+    _total_llm_cost_usd: float = 0.0
+    _budget_aborted: bool = False
+
+    # Live-LLM client initialisation (only for live-llm mode)
+    _live_haiku = None
+    _live_gemini = None
+    _live_deepseek = None
+    _live_tracker = None
+    if cfg.mode == "live-llm":
+        from src.config import Settings
+        from src.llm.base import CostBudgetExceeded as _CostBudgetExceeded
+        from src.llm.base import CostTracker as _CostTracker
+        from src.llm.deepseek_risk import DeepSeekRisk as _DeepSeekRisk
+        from src.llm.gemini_execution import GeminiExecution as _GeminiExecution
+        from src.llm.haiku_structural import HaikuStructural as _HaikuStructural
+        _settings = Settings()
+        _live_tracker = _CostTracker()
+        _live_haiku = _HaikuStructural(_settings.anthropic_api_key, _live_tracker, db=db)
+        _live_gemini = _GeminiExecution(_settings.google_api_key, _live_tracker, db=db)
+        _live_deepseek = _DeepSeekRisk(_settings.huggingface_api_key, _live_tracker, db=db)
 
     for bar in all_bars:
 
@@ -204,11 +220,69 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
             now_et=dt_et,
         )
 
-        # --- stubs ---
-        haiku = haiku_stub.evaluate(snapshot)
-        gemini = gemini_stub.evaluate(haiku, snapshot, state.position, state.equity)
-
+        # --- pipeline dispatch: stub or live-llm ---
         atr14 = snapshot.atr14 or 1.0
+
+        if cfg.mode == "live-llm":
+            # Budget-aborted: skip remaining bars entirely
+            if _budget_aborted:
+                continue
+            try:
+                haiku_result = _live_haiku.evaluate(snapshot, bar_ts=bar.ts)
+                _total_llm_cost_usd = _live_tracker.total_usd
+                haiku = haiku_result.parsed
+                if haiku is None:
+                    haiku = dict(_live_haiku.safe_default)
+                # Haiku fallback -> hold, skip Gemini/DeepSeek (cost saving)
+                if haiku_result.used_fallback:
+                    gemini = {
+                        "action": "hold",
+                        "stop_price": 0.0,
+                        "trailing_stop_atr_multiple": 2.0,
+                        "reasoning": "haiku_fallback",
+                    }
+                    deepseek = {
+                        "approved": False,
+                        "violations": ["HAIKU_FALLBACK"],
+                        "override_action": "hold",
+                        "reasoning": "Haiku used safe_default; holding bar.",
+                    }
+                else:
+                    gemini_result = _live_gemini.evaluate(
+                        haiku, snapshot, state.position, state.equity, bar_ts=bar.ts
+                    )
+                    _total_llm_cost_usd = _live_tracker.total_usd
+                    gemini = gemini_result.parsed or {
+                        "action": "hold", "stop_price": 0.0,
+                        "trailing_stop_atr_multiple": 2.0, "reasoning": "parse_error",
+                    }
+                    _gem_stop = gemini.get("stop_price") or 0.0
+                    if _gem_stop:
+                        _sz = compute_size(entry=mark_price, stop=_gem_stop)
+                    else:
+                        _fb = mark_price - atr14 * 2.0
+                        if _fb <= 0:
+                            _fb = mark_price * 0.99
+                        _sz = compute_size(entry=mark_price, stop=_fb)
+                    _pqty = _sz.contracts if _sz.contracts > 0 else 0
+                    deepseek_result = _live_deepseek.evaluate(
+                        gemini, max(_pqty, 1), state, atr14, bar_ts=bar.ts
+                    )
+                    _total_llm_cost_usd = _live_tracker.total_usd
+                    deepseek = deepseek_result.parsed or {
+                        "approved": False, "violations": ["PARSE_ERROR"],
+                        "override_action": "hold", "reasoning": "parse_error",
+                    }
+            except _CostBudgetExceeded:
+                _budget_aborted = True
+                _total_llm_cost_usd = _live_tracker.total_usd
+                continue
+        else:
+            # --- stubs ---
+            haiku = haiku_stub.evaluate(snapshot)
+            gemini = gemini_stub.evaluate(haiku, snapshot, state.position, state.equity)
+            deepseek = None  # computed below after sizing
+
         gemini_stop = gemini.get("stop_price") or 0.0
 
         if gemini_stop:
@@ -221,9 +295,10 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
 
         proposed_qty = sizing.contracts if sizing.contracts > 0 else 0
 
-        deepseek = deepseek_stub.evaluate(
-            gemini, max(proposed_qty, 1), state, atr14
-        )
+        if cfg.mode != "live-llm":
+            deepseek = deepseek_stub.evaluate(
+                gemini, max(proposed_qty, 1), state, atr14
+            )
 
         gemini_action = gemini.get("action", "hold")
 
@@ -404,6 +479,9 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
             if dd > max_dd_pct:
                 max_dd_pct = dd
 
+    if cfg.mode == "live-llm" and _live_tracker is not None:
+        _total_llm_cost_usd = _live_tracker.total_usd
+
     stats = {
         "start_equity": start_equity,
         "end_equity": end_equity,
@@ -415,7 +493,10 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
         "max_drawdown_pct": max_dd_pct,
         "bars_processed": len(all_bars),
         "elapsed_sec": elapsed,
+        "total_llm_cost_usd": _total_llm_cost_usd,
     }
+    if _budget_aborted:
+        stats["aborted_reason"] = "budget_exceeded"
 
     if cfg.write_equity_png:
         from src.backtest.reports import write_equity_curve_png
