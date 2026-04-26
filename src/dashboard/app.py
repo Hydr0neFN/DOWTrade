@@ -28,6 +28,14 @@ async def index(request: Request):
     eq = db._conn.execute("SELECT * FROM equity ORDER BY date DESC LIMIT 1").fetchone()
     today_realized = eq["realized_pnl"] if eq else 0.0
     unrealized = eq["unrealized_pnl"] if eq else 0.0
+    account = {
+        "equity":       round(eq["end_equity"], 2)   if eq else 0.0,
+        "start_equity": round(eq["start_equity"], 2) if eq else 0.0,
+        "day_pnl":      round((eq["realized_pnl"] or 0.0) + (eq["unrealized_pnl"] or 0.0), 2) if eq else 0.0,
+        "commission":   round(eq["commission"], 2)   if eq else 0.0,
+        "trades":       int(eq["trade_count"])       if eq else 0,
+        "as_of":        eq["date"]                   if eq else "—",
+    }
     
     pos_cur = db._conn.execute('''
         SELECT sum(CASE WHEN o.side = 'BUY' THEN f.qty ELSE -f.qty END) as qty,
@@ -67,7 +75,7 @@ async def index(request: Request):
     decisions_list = list(d_map.values())[:3]
     db.close()
     
-    return templates.TemplateResponse(request=request, name="index.html", context={"request": request, "position": position, "today_realized": today_realized, "decisions": decisions_list})
+    return templates.TemplateResponse(request=request, name="index.html", context={"request": request, "position": position, "today_realized": today_realized, "decisions": decisions_list, "account": account})
 
 @app.get("/equity", response_class=HTMLResponse)
 async def equity(request: Request):
@@ -103,6 +111,14 @@ async def api_refresh():
     eq = db._conn.execute("SELECT * FROM equity ORDER BY date DESC LIMIT 1").fetchone()
     today_realized = eq["realized_pnl"] if eq else 0.0
     unrealized = eq["unrealized_pnl"] if eq else 0.0
+    account = {
+        "equity":       round(eq["end_equity"], 2)   if eq else 0.0,
+        "start_equity": round(eq["start_equity"], 2) if eq else 0.0,
+        "day_pnl":      round((eq["realized_pnl"] or 0.0) + (eq["unrealized_pnl"] or 0.0), 2) if eq else 0.0,
+        "commission":   round(eq["commission"], 2)   if eq else 0.0,
+        "trades":       int(eq["trade_count"])       if eq else 0,
+        "as_of":        eq["date"]                   if eq else "—",
+    }
     
     pos_cur = db._conn.execute('''
         SELECT sum(CASE WHEN o.side = 'BUY' THEN f.qty ELSE -f.qty END) as qty,
