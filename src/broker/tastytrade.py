@@ -566,9 +566,21 @@ class TastytradeBroker(Broker):
             
             run_task = asyncio.create_task(streamer.run())
             
-            for _ in range(50):
-                await asyncio.sleep(0.1)
+            # Wait up to 30s, but exit early once the stream stalls (no new bars
+            # for 3s) AND we have at least some data, OR we have hit end_ts.
+            stall_window = 3.0
+            last_count = 0
+            last_change = asyncio.get_event_loop().time()
+            deadline = asyncio.get_event_loop().time() + 30.0
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.25)
+                cur_count = len(bars)
+                if cur_count != last_count:
+                    last_count = cur_count
+                    last_change = asyncio.get_event_loop().time()
                 if bars and bars[-1].ts_utc >= end_ts:
+                    break
+                if cur_count > 0 and (asyncio.get_event_loop().time() - last_change) > stall_window:
                     break
             
             await streamer.close()
