@@ -1,6 +1,14 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="card">
+    <h3>Account</h3>
+    <p id="acct-equity">Equity: ${{ "{:,.2f}".format(account.equity) }}</p>
+    <p id="acct-day-pnl">Day P&amp;L: ${{ "{:,.2f}".format(account.day_pnl) }}</p>
+    <p id="acct-trades">Trades today: {{ account.trades }}</p>
+    <p id="acct-commission">Commission: ${{ "{:,.2f}".format(account.commission) }}</p>
+    <p id="acct-asof"><small>As of {{ account.as_of }}</small></p>
+</div>
+<div class="card">
     <h3>Current Position</h3>
     <p id="pos-qty">Qty: {{ position.qty }}</p>
     <p id="pos-side">Side: {{ position.side }}</p>
