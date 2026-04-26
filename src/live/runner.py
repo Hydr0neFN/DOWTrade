@@ -22,6 +22,11 @@ from src.backtest.harness import final_check, compute_size
 log = logging.getLogger(__name__)
 
 class LiveRunner:
+    # Minimum bars in window before we run the LLM pipeline. SMA-200 is the
+    # binding indicator. Cert sandbox does not provide historical Candle replay
+    # over dxLink, so this accumulates from the first live bar (~50h at 15m).
+    MIN_WARMUP_BARS = 200
+
     def __init__(self):
         self.settings = Settings()
         self.db = Database(self.settings.db_path)
@@ -96,8 +101,7 @@ class LiveRunner:
                 if self._budget_exceeded:
                     continue
 
-                # We need at least 200 bars typically, but let's build what we can
-                if len(self.window) < 20:
+                if len(self.window) < self.MIN_WARMUP_BARS:
                     continue
                     
                 snapshot = build_snapshot(self.window.as_list())

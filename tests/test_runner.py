@@ -27,6 +27,7 @@ def mock_broker():
 @pytest.fixture
 def runner(mock_db, mock_broker):
     r = LiveRunner()
+    r.MIN_WARMUP_BARS = 20
     r.db = mock_db
     r.broker = mock_broker
     r.haiku = MagicMock()
