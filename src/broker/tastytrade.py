@@ -538,24 +538,23 @@ class TastytradeBroker(Broker):
         
         def on_candle(sym: str, candle: dict):
             ts = candle.get("time", 0) // 1000
-            if start_ts <= ts <= end_ts:
-
-                vol_raw = candle.get("volume", 0)
+            if not (start_ts <= ts <= end_ts):
+                return
+            # Drop dxFeed snapshot tombstones: a single event at exactly fromTime
+            # with all OHLC = NaN/0 means "no history available" (cert sandbox).
+            import math as _m
+            def _f(x):
                 try:
-                    vol_f = float(vol_raw)
-                    import math
-                    vol_int = 0 if math.isnan(vol_f) else int(vol_f)
-                except (ValueError, TypeError):
-                    vol_int = 0
-                
-                bars.append(Bar(
-                    ts_utc=ts,
-                    open=candle.get("open", 0.0),
-                    high=candle.get("high", 0.0),
-                    low=candle.get("low", 0.0),
-                    close=candle.get("close", 0.0),
-                    volume=vol_int
-                ))
+                    v = float(x)
+                    return None if _m.isnan(v) else v
+                except (TypeError, ValueError):
+                    return None
+            o, h, lo, c = (_f(candle.get(k, 0.0)) for k in ("open", "high", "low", "close"))
+            if None in (o, h, lo, c) or (o == 0.0 and h == 0.0 and lo == 0.0 and c == 0.0):
+                return
+            v = _f(candle.get("volume", 0))
+            vol_int = 0 if v is None else int(v)
+            bars.append(Bar(ts_utc=ts, open=o, high=h, low=lo, close=c, volume=vol_int))
 
         async def run_fetch():
             streamer = DxLinkStreamer(dxlink_url, dxlink_token, on_candle)
