@@ -22,6 +22,8 @@ class DxLinkStreamer:
         self._channel = 3
 
     async def connect(self):
+        # Ensure keepalive loop will run even when connect() is called before run().
+        self._running = True
         self.ws = await websockets.connect(self.dxlink_url)
         # 1. Send SETUP
         await self._send({"type": "SETUP", "channel": 0, "version": "0.1", "keepaliveTimeout": 60, "acceptKeepaliveTimeout": 60})
@@ -97,12 +99,22 @@ class DxLinkStreamer:
         log.info(f"Subscribed to {symbol} from {from_time_ms}")
 
     async def _keepalive_loop(self):
+        n = 0
         try:
             while self._running:
                 await asyncio.sleep(30)
+                if not self.ws:
+                    log.warning("keepalive: ws is None, exiting loop")
+                    return
                 await self._send({"type": "KEEPALIVE", "channel": 0})
+                n += 1
+                # Log every 5th to avoid spam (~2.5 min cadence)
+                if n % 5 == 0:
+                    log.info("keepalive: sent %d pings", n)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            log.error(f"Keepalive error: {e}")
+            log.error("keepalive loop error: %s", e, exc_info=True)
 
     def _process_feed_data(self, data: list):
         # COMPACT format: ["Candle", [fields...]]
