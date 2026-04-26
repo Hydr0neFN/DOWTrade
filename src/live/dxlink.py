@@ -113,25 +113,42 @@ class DxLinkStreamer:
             for i in range(0, len(fields), num_fields):
                 chunk = fields[i:i+num_fields]
                 if len(chunk) == num_fields:
-                    candle = {
-                        "eventSymbol": chunk[0],
-                        "time": chunk[1],
-                        "open": chunk[2],
-                        "high": chunk[3],
-                        "low": chunk[4],
-                        "close": chunk[5],
-                        "volume": chunk[6],
-                    }
-                    # Filter completed bars (time + period < now)
-                    # For simplicity, we pass to on_candle and let runner handle,
-                    # or filter here if period is given.
-                    # period_ms: 15m = 15 * 60 * 1000 = 900000
-                    period_ms = int(self._period.replace("m", "")) * 60 * 1000
-                    now_ms = int(asyncio.get_event_loop().time() * 1000) # This is loop time, not real wall clock.
-                    import time
-                    real_now_ms = int(time.time() * 1000)
+                    # Coerce numeric fields; dxFeed can emit "NaN" strings for empty bars.
+                    def _num(x, default=0.0):
+                        try:
+                            f = float(x)
+                            import math as _m
+                            return default if _m.isnan(f) else f
+                        except (TypeError, ValueError):
+                            return default
+                    try:
+                        t_ms = int(_num(chunk[1], default=0))
+                        if t_ms <= 0:
+                            continue  # tombstone / empty chunk
+                        candle = {
+                            "eventSymbol": chunk[0],
+                            "time": t_ms,
+                            "open": _num(chunk[2]),
+                            "high": _num(chunk[3]),
+                            "low": _num(chunk[4]),
+                            "close": _num(chunk[5]),
+                            "volume": _num(chunk[6]),
+                        }
+                    except Exception as _e:
+                        log.warning(f"Skipped malformed candle chunk: {_e} chunk={chunk!r}")
+                        continue
+                    # period_ms: e.g. 15m -> 900000
+                    try:
+                        period_ms = int(self._period.replace("m", "")) * 60 * 1000
+                    except Exception:
+                        period_ms = 15 * 60 * 1000
+                    import time as _time
+                    real_now_ms = int(_time.time() * 1000)
                     if candle["time"] + period_ms <= real_now_ms:
-                        self.on_candle(candle["eventSymbol"], candle)
+                        try:
+                            self.on_candle(candle["eventSymbol"], candle)
+                        except Exception as _e:
+                            log.error(f"on_candle handler raised: {_e}", exc_info=True)
 
     async def run(self):
         self._running = True
@@ -161,11 +178,16 @@ class DxLinkStreamer:
                     log.info("DxLink closed normally.")
                 else:
                     log.error(f"DxLink connection error: {e}")
+                # Tear down so next iteration triggers a real reconnect.
+                if self._keepalive_task:
+                    self._keepalive_task.cancel()
+                    self._keepalive_task = None
                 if self.ws:
                     try:
                         await self.ws.close()
-                    except:
+                    except Exception:
                         pass
+                self.ws = None
                 if not self._running:
                     break
                 await asyncio.sleep(backoff)
