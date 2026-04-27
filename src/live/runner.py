@@ -1,7 +1,11 @@
 import asyncio
 import logging
+import math
+import os
 from datetime import datetime
 from typing import Optional
+
+import yfinance as yf
 
 from src.config import Settings
 from src.db.repo import Database
@@ -10,6 +14,7 @@ from src.data.bars import Bar as DataBar
 from src.broker.models import Order, Position, AccountState
 from src.broker.tastytrade import TastytradeBroker, dxfeed_symbol
 from src.live.dxlink import DxLinkStreamer
+from src.live.yfinance_poller import YFinancePoller
 
 from src.data.bars import BarWindow
 from src.data.features import MarketSnapshot, build_snapshot
@@ -22,9 +27,12 @@ from src.backtest.harness import final_check, compute_size
 log = logging.getLogger(__name__)
 
 class LiveRunner:
+    # Use yfinance for market data when dxLink cert has no live data subscription.
+    # Default ON. Set USE_YFINANCE=0 in .env to revert to dxLink streaming.
+    USE_YFINANCE = os.environ.get("USE_YFINANCE", "1") == "1"
+
     # Minimum bars in window before we run the LLM pipeline. SMA-200 is the
-    # binding indicator. Cert sandbox does not provide historical Candle replay
-    # over dxLink, so this accumulates from the first live bar (~50h at 15m).
+    # binding indicator. With yfinance hydration this is met immediately on boot.
     MIN_WARMUP_BARS = 200
 
     def __init__(self):
@@ -48,12 +56,35 @@ class LiveRunner:
         self.candle_queue.put_nowait(candle)
 
     async def _hydrate_window(self):
-        end_ts = int(datetime.now().timestamp())
-        start_ts = end_ts - 5 * 24 * 3600
-        bars = self.broker.fetch_historical_bars("MYM", start_ts, end_ts)
-        for b in bars:
-            self.window.append(DataBar(ts=b.ts_utc, o=b.open, h=b.high, l=b.low, c=b.close, v=int(b.volume)))
-        log.info(f"Hydrated BarWindow with {len(self.window)} bars")
+        if self.USE_YFINANCE:
+            loop = asyncio.get_event_loop()
+            df = await loop.run_in_executor(
+                None, lambda: yf.download("MYM=F", period="5d", interval="15m", progress=False)
+            )
+            if not df.empty:
+                if hasattr(df.columns, "get_level_values"):
+                    df.columns = df.columns.get_level_values(0)
+                for row in df.itertuples():
+                    try:
+                        o = float(row.Open); h = float(row.High)
+                        lo = float(row.Low); c = float(row.Close)
+                        if any(math.isnan(x) for x in (o, h, lo, c)):
+                            continue
+                        v_f = float(row.Volume or 0)
+                        v = 0 if math.isnan(v_f) else int(v_f)
+                        ts = int(row.Index.timestamp())
+                        bar = DataBar(ts=ts, o=o, h=h, l=lo, c=c, v=v)
+                        self.window.append(bar)
+                        self.db.insert_bar({"ts": str(ts), "open": o, "high": h, "low": lo, "close": c, "volume": v})
+                    except Exception:
+                        continue
+        else:
+            end_ts = int(datetime.now().timestamp())
+            start_ts = end_ts - 5 * 24 * 3600
+            bars = self.broker.fetch_historical_bars("MYM", start_ts, end_ts)
+            for b in bars:
+                self.window.append(DataBar(ts=b.ts_utc, o=b.open, h=b.high, l=b.low, c=b.close, v=int(b.volume)))
+        log.info("Hydrated BarWindow with %d bars", len(self.window))
 
     def _reset_daily_state(self):
         now = datetime.now()
@@ -93,7 +124,7 @@ class LiveRunner:
                     continue
                     
                 self.window.append(bar)
-                self.db.insert_bars([bar])
+                self.db.insert_bar({"ts": str(bar.ts), "open": bar.o, "high": bar.h, "low": bar.l, "close": bar.c, "volume": bar.v})
                 
                 state = self.broker.get_account_state()
                 self.db.insert_equity_record(bar.ts, state.equity, state.realized_pnl_today, state.unrealized_pnl)
@@ -194,18 +225,22 @@ class LiveRunner:
         self.broker.connect()
         await self._hydrate_window()
         
-        token_data = self.broker.get_dxlink_token()
-        self.streamer = DxLinkStreamer(
-            token_data["dxlink-url"],
-            token_data["token"],
-            self._on_candle,
-            token_refresh_fn=lambda: self.broker.get_dxlink_token()["token"],
-        )
-        await self.streamer.connect()
-        
-        target_sym = dxfeed_symbol("MYM") + "{=15m}"
-        from_ms = int(datetime.now().timestamp() * 1000)
-        await self.streamer.subscribe_candles(target_sym, "15m", from_ms)
+        if self.USE_YFINANCE:
+            self.streamer = YFinancePoller("MYM=F", self._on_candle)
+            await self.streamer.connect()
+            await self.streamer.subscribe_candles("MYM=F", "15m", from_time_ms=0)
+        else:
+            token_data = self.broker.get_dxlink_token()
+            self.streamer = DxLinkStreamer(
+                token_data["dxlink-url"],
+                token_data["token"],
+                self._on_candle,
+                token_refresh_fn=lambda: self.broker.get_dxlink_token()["token"],
+            )
+            await self.streamer.connect()
+            target_sym = dxfeed_symbol("MYM") + "{=15m}"
+            from_ms = int(datetime.now().timestamp() * 1000)
+            await self.streamer.subscribe_candles(target_sym, "15m", from_ms)
         
         asyncio.create_task(self.streamer.run())
         asyncio.create_task(self._process_loop())
