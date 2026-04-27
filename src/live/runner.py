@@ -23,6 +23,7 @@ from src.llm.haiku_structural import HaikuStructural
 from src.llm.gemini_execution import GeminiExecution
 from src.llm.deepseek_risk import DeepSeekRisk
 from src.backtest.harness import final_check, compute_size
+import json
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +128,15 @@ class LiveRunner:
                 self.db.insert_bar({"ts": str(bar.ts), "open": bar.o, "high": bar.h, "low": bar.l, "close": bar.c, "volume": bar.v})
                 
                 state = self.broker.get_account_state()
-                self.db.insert_equity_record(bar.ts, state.equity, state.realized_pnl_today, state.unrealized_pnl)
+                self.db.insert_equity({
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "start_equity": state.equity,
+                    "end_equity": state.equity,
+                    "realized_pnl": getattr(state, "realized_pnl_today", 0.0),
+                    "unrealized_pnl": getattr(state, "unrealized_pnl", 0.0),
+                    "commission": 0.0,
+                    "trade_count": 0,
+                })
                 
                 if self._budget_exceeded:
                     continue
@@ -159,20 +168,26 @@ class LiveRunner:
                 ds_res = ds_result.parsed or {"approved": False, "violations": ["PARSE_ERROR"], "override_action": "hold"}
                 
                 action = gemini_res.get("action", "hold")
+                _dir_map = {"open_long": "LONG", "open_short": "SHORT"}
+                direction = _dir_map.get(action, "FLAT")
+                raw_votes = json.dumps({"haiku": haiku_res, "gemini": gemini_res, "ds": ds_res})
                 decision = {
                     "bar_ts": bar.ts,
                     "action": action,
                     "reasoning": f"Haiku {haiku_res.get('regime')}, Gemini {action}, DS approved={ds_res.get('approved')}",
                     "disagreement_flags": {"haiku": haiku_res, "gemini": gemini_res, "ds": ds_res}
                 }
-                
-                self.db.insert_decision(
-                    bar_ts=bar.ts,
-                    action=action,
-                    reasoning=decision["reasoning"],
-                    disagreement_flags=decision["disagreement_flags"],
-                    cost_usd=self.tracker.total_usd
-                )
+
+                self.db.insert_decision({
+                    "bar_ts": str(bar.ts),
+                    "direction": direction,
+                    "confidence": float(haiku_res.get("confidence", 0.5) or 0.5),
+                    "stop_price": float(gem_stop or 0.0),
+                    "entry_price": float(bar.c),
+                    "raw_votes": raw_votes,
+                    "safety_ok": 1 if ds_res.get("approved") else 0,
+                    "safety_notes": str(ds_res.get("violations", [])),
+})
                 
                 # We only execute if DeepSeek approved and action is an open/close
                 # For simplicity, we just check open_long/open_short as in original runner
@@ -198,21 +213,34 @@ class LiveRunner:
                     if guard.approved:
                         try:
                             self.broker.submit_bracket_order(order)
-                            self.db.insert_order(order, bar_ts=bar.ts)
+                            self.db.insert_order({
+                                "ts": str(bar.ts), "decision_id": None, "broker_id": "",
+                                "symbol": order.symbol, "side": order.side, "qty": order.qty,
+                                "order_type": "bracket", "limit_price": 0.0,
+                                "stop_price": float(order.stop_price or 0.0),
+                                "status": "submitted", "raw_response": "",
+                            })
                         except Exception as e:
                             log.error(f"Order submission failed: {e}")
-                            order.status = "rejected"
-                            self.db.insert_order(order, bar_ts=bar.ts)
+                            self.db.insert_order({
+                                "ts": str(bar.ts), "decision_id": None, "broker_id": "",
+                                "symbol": order.symbol, "side": order.side, "qty": order.qty,
+                                "order_type": "bracket", "limit_price": 0.0,
+                                "stop_price": float(order.stop_price or 0.0),
+                                "status": "rejected", "raw_response": str(e),
+                            })
                     else:
                         log.info("final_check rejected the order")
-                        decision["disagreement_flags"]["final_check"] = guard.reason
-                        self.db.insert_decision(
-                            bar_ts=bar.ts,
-                            action="none",
-                            reasoning=f"final_check rejected: {guard.reason}",
-                            disagreement_flags=decision["disagreement_flags"],
-                            cost_usd=self.tracker.total_usd
-                        )
+                        self.db.insert_decision({
+                            "bar_ts": str(bar.ts),
+                            "direction": "FLAT",
+                            "confidence": 0.0,
+                            "stop_price": 0.0,
+                            "entry_price": float(bar.c),
+                            "raw_votes": raw_votes,
+                            "safety_ok": 0,
+                            "safety_notes": f"final_check rejected: {guard.reason}",
+})
 
             except CostBudgetExceeded:
                 log.warning("CostBudgetExceeded. Stopping orders for the day.")
