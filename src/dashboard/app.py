@@ -143,7 +143,8 @@ async def api_refresh():
             "unrealized": round(unrealized, 2)
         },
         "today_realized": today_realized,
-        "last_decision": dict(last_d) if last_d else None
+        "last_decision": dict(last_d) if last_d else None,
+        "account": account,
     }
 
 @app.get("/api/equity")
