@@ -8,10 +8,13 @@ import websockets
 log = logging.getLogger(__name__)
 
 class DxLinkStreamer:
-    def __init__(self, dxlink_url: str, dxlink_token: str, on_candle: Callable[[str, dict], None]):
+    def __init__(self, dxlink_url: str, dxlink_token: str, on_candle: Callable[[str, dict], None],
+                 token_refresh_fn=None):
         self.dxlink_url = dxlink_url
         self.dxlink_token = dxlink_token
         self.on_candle = on_candle
+        # Optional callback: () -> str  — called on AUTH_STATE UNAUTHORIZED to get fresh token.
+        self._token_refresh_fn = token_refresh_fn
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
         self._keepalive_task = None
@@ -181,8 +184,17 @@ class DxLinkStreamer:
                     data = msg.get("data", [])
                     self._process_feed_data(data)
                 elif msg_type == "AUTH_STATE" and msg.get("state") == "UNAUTHORIZED":
-                    log.warning("AUTH_STATE UNAUTHORIZED mid-stream. Re-authenticating.")
-                    await self._send({"type": "AUTH", "channel": 0, "token": self.dxlink_token})
+                    log.warning("AUTH_STATE UNAUTHORIZED — dxLink token expired, refreshing.")
+                    if self._token_refresh_fn:
+                        try:
+                            self.dxlink_token = self._token_refresh_fn()
+                            log.info("Token refreshed; closing WS to reconnect with new token.")
+                        except Exception as ref_exc:
+                            log.error("Token refresh failed: %s", ref_exc)
+                    # Close the WS — run()'s except block will nil ws and reconnect
+                    # using the (now-refreshed) self.dxlink_token.
+                    if self.ws:
+                        await self.ws.close()
 
             except Exception as e:
                 import websockets

@@ -195,7 +195,12 @@ class LiveRunner:
         await self._hydrate_window()
         
         token_data = self.broker.get_dxlink_token()
-        self.streamer = DxLinkStreamer(token_data["dxlink-url"], token_data["token"], self._on_candle)
+        self.streamer = DxLinkStreamer(
+            token_data["dxlink-url"],
+            token_data["token"],
+            self._on_candle,
+            token_refresh_fn=lambda: self.broker.get_dxlink_token()["token"],
+        )
         await self.streamer.connect()
         
         target_sym = dxfeed_symbol("MYM") + "{=15m}"
