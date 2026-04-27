@@ -17,7 +17,7 @@
     <p id="pos-realized">Today Realized: {{ today_realized }}</p>
 </div>
 <div class="card">
-    <h3>Last 3 Decisions</h3>
+    <h3>Last 3 Decisions <span id="last-decision" style="font-size:0.8em;font-weight:normal;margin-left:8px;color:#aaa"></span></h3>
     {% for d in decisions %}
         <div>
             <b>{{ d.bar_ts }}</b>: {{ d.direction }} (Confidence: {{ d.confidence }})
