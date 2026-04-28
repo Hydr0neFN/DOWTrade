@@ -1,32 +1,85 @@
 {% extends "base.html" %}
+{% block title %}Overview &mdash; DOWTrade{% endblock %}
+
 {% block content %}
-<div class="card">
-    <h3>Account</h3>
-    <p id="acct-equity">Equity: ${{ "{:,.2f}".format(account.equity) }}</p>
-    <p id="acct-day-pnl">Day P&amp;L: ${{ "{:,.2f}".format(account.day_pnl) }}</p>
-    <p id="acct-trades">Trades today: {{ account.trades }}</p>
-    <p id="acct-commission">Commission: ${{ "{:,.2f}".format(account.commission) }}</p>
-    <p id="acct-asof"><small>As of {{ account.as_of }}</small></p>
-</div>
-<div class="card">
-    <h3>Current Position</h3>
-    <p id="pos-qty">Qty: {{ position.qty }}</p>
-    <p id="pos-side">Side: {{ position.side }}</p>
-    <p id="pos-avg">Avg Price: {{ position.avg_price }}</p>
-    <p id="pos-unrealized">Unrealized PnL: {{ position.unrealized }}</p>
-    <p id="pos-realized">Today Realized: {{ today_realized }}</p>
-</div>
-<div class="card">
-    <h3>Last 3 Decisions <span id="last-decision" style="font-size:0.8em;font-weight:normal;margin-left:8px;color:#aaa"></span></h3>
-    {% for d in decisions %}
-        <div>
-            <b>{{ d.bar_ts }}</b>: {{ d.direction }} (Confidence: {{ d.confidence }})
-            <ul>
-            {% for call in d.llm_calls %}
-                <li><i>{{ call.model }}</i>: {{ call.raw_response[:100] }}...</li>
-            {% endfor %}
-            </ul>
+<!-- Top stat row -->
+<div class="row g-3 mb-3">
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Equity</div>
+        <div class="stat-value text-white" id="acct-equity">${{ "{:,.2f}".format(account.equity) }}</div>
+        <div class="text-secondary" style="font-size:.72rem;" id="acct-asof">As of {{ account.as_of }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Day P&amp;L</div>
+        <div class="stat-value {% if account.day_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}" id="acct-day-pnl">${{ "{:,.2f}".format(account.day_pnl) }}</div>
+        <div class="text-secondary" style="font-size:.72rem;"><span id="acct-trades">{{ account.trades }}</span> trade(s) &middot; <span id="acct-commission">${{ "{:,.2f}".format(account.commission) }}</span> comm</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Position</div>
+        <div class="stat-value text-white">
+          <span id="pos-side">{{ position.side }}</span>
+          <span class="text-secondary" style="font-size:1rem;font-weight:500;">x<span id="pos-qty">{{ position.qty }}</span></span>
         </div>
-    {% endfor %}
+        <div class="text-secondary" style="font-size:.72rem;">avg <span id="pos-avg">{{ position.avg_price }}</span> &middot; uPnL <span id="pos-unrealized">{{ position.unrealized }}</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card stat-card h-100">
+      <div class="card-body">
+        <div class="stat-label">Last Decision</div>
+        <div class="stat-value text-white" id="last-decision-dir">&mdash;</div>
+        <div class="text-secondary" style="font-size:.72rem;">
+          <span id="last-decision-time">&mdash;</span><br>
+          <span class="heartbeat-dot hb-bad" id="hb-dot"></span><span id="hb-text">poller: &mdash;</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Recent decisions preview -->
+<div class="card mb-3">
+  <div class="card-header d-flex align-items-center justify-content-between">
+    <span><i class="bi bi-diagram-3 me-2"></i>Recent Decisions</span>
+    <a href="/disagreements" class="btn btn-sm btn-outline-secondary">View all</a>
+  </div>
+  <div class="card-body">
+    {% if not decisions %}
+      <p class="text-secondary mb-0">No decisions yet.</p>
+    {% else %}
+      <div class="row g-2">
+        {% for d in decisions %}
+          <div class="col-12 col-md-4">
+            <div class="card h-100">
+              <div class="card-body">
+                <div class="d-flex justify-content-between align-items-start mb-2">
+                  <span class="text-secondary" style="font-size:.78rem;font-family:monospace;">{{ d.bar_ts }}</span>
+                  {% set dir = (d.direction or 'FLAT') | upper %}
+                  {% if dir == 'LONG' %}<span class="badge badge-long">LONG</span>
+                  {% elif dir == 'SHORT' %}<span class="badge badge-short">SHORT</span>
+                  {% else %}<span class="badge badge-flat">FLAT</span>{% endif %}
+                </div>
+                <div class="text-secondary" style="font-size:.78rem;">conf {{ "%.2f" | format(d.confidence or 0) }} &middot; entry ${{ "%.2f" | format(d.entry_price or 0) }}</div>
+                {% if d.safety_ok == 0 %}
+                  <div class="mt-2"><span class="badge badge-rejected" style="font-size:.65rem;">REJECTED</span> <span class="text-secondary" style="font-size:.7rem;">{{ (d.safety_notes or '') | truncate(40) }}</span></div>
+                {% endif %}
+              </div>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
 </div>
 {% endblock %}
