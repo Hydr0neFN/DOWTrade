@@ -37,7 +37,16 @@ GEMINI_MODELS = [
 # CLI primary path — uses the user's signed-in Pro plan, giving access to
 # 3.x Pro models the free-tier API paywalls. Opt-in via USE_GEMINI_CLI=1.
 GEMINI_CLI_PATH    = os.environ.get("GEMINI_CLI_PATH", "/usr/bin/gemini")
-GEMINI_CLI_MODEL   = os.environ.get("GEMINI_CLI_MODEL", "gemini-3.1-pro-preview")
+# CLI fallback chain. Pro models share one quota pool; Flash models share another.
+# When Pro quota exhausts, the loop drops to Flash automatically (separate quota).
+# Override with GEMINI_CLI_MODELS env var (comma-separated). Singular
+# GEMINI_CLI_MODEL still respected for backward compat.
+_default_cli_chain = "gemini-3.1-pro-preview,gemini-3-pro-preview,gemini-3-flash-preview,gemini-2.5-flash"
+_legacy_single = os.environ.get("GEMINI_CLI_MODEL")
+GEMINI_CLI_MODELS = [
+    m.strip() for m in os.environ.get("GEMINI_CLI_MODELS", _legacy_single or _default_cli_chain).split(",")
+    if m.strip()
+]
 GEMINI_CLI_TIMEOUT = int(os.environ.get("GEMINI_CLI_TIMEOUT", "60"))
 USE_GEMINI_CLI     = os.environ.get("USE_GEMINI_CLI", "0").lower() in ("1", "true", "yes")
 
@@ -71,31 +80,43 @@ class GeminiExecution(LLMClient):
         self._last_model = GEMINI_MODELS[-1]  # default to final fallback
 
     def _call_via_cli(self, system: str, user: str) -> Tuple[str, int, int]:
-        """Call the local gemini CLI (Pro-plan 3.1 Pro). Raises on any failure.
+        """Call the local gemini CLI, walking the CLI fallback chain.
+
+        Tries each model in GEMINI_CLI_MODELS until one returns a non-empty
+        response. Pro models share one quota pool; Flash share another, so
+        when Pro is exhausted the loop drops to Flash on the next iteration.
 
         Returns (response_text, estimated_in_tokens, estimated_out_tokens).
-        Token counts are estimates (chars/4) — CLI does not surface usage.
-        Sets self._last_model to 'cli:<model>' on success.
+        Token counts are char/4 estimates (CLI does not surface usage).
+        Sets self._last_model to 'cli:<router-picked-model>' on success.
+        Raises on full-chain failure.
         """
         if not os.path.exists(GEMINI_CLI_PATH):
             raise FileNotFoundError(f"gemini CLI not at {GEMINI_CLI_PATH}")
         full_prompt = system + chr(10) + chr(10) + user
-        proc = subprocess.run(
-            [GEMINI_CLI_PATH, "-m", GEMINI_CLI_MODEL, "-o", "json", "-y", "-p", full_prompt],
-            capture_output=True, text=True, timeout=GEMINI_CLI_TIMEOUT,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(f"gemini CLI exit {proc.returncode}: {proc.stderr[-200:]}")
-        payload = json.loads(proc.stdout)
-        text = payload.get("response", "") or ""
-        if not text.strip():
-            raise RuntimeError("gemini CLI returned empty response")
-        # Tag with the actual router-picked model when available.
-        actual = list(payload.get("stats", {}).get("models", {}).keys())
-        self._last_model = f"cli:{actual[0] if actual else GEMINI_CLI_MODEL}"
-        est_in = max(1, len(full_prompt) // 4)
-        est_out = max(1, len(text) // 4)
-        return text, est_in, est_out
+        last_exc = None
+        for model in GEMINI_CLI_MODELS:
+            try:
+                proc = subprocess.run(
+                    [GEMINI_CLI_PATH, "-m", model, "-o", "json", "-y", "-p", full_prompt],
+                    capture_output=True, text=True, timeout=GEMINI_CLI_TIMEOUT,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(f"exit {proc.returncode}: {proc.stderr[-160:]}")
+                payload = json.loads(proc.stdout)
+                text = payload.get("response", "") or ""
+                if not text.strip():
+                    raise RuntimeError("empty response")
+                actual = list(payload.get("stats", {}).get("models", {}).keys())
+                self._last_model = f"cli:{actual[0] if actual else model}"
+                est_in = max(1, len(full_prompt) // 4)
+                est_out = max(1, len(text) // 4)
+                return text, est_in, est_out
+            except Exception as exc:
+                log.warning("[gemini-cli] %s failed (%s) — trying next", model, str(exc)[:120])
+                last_exc = exc
+                continue
+        raise RuntimeError(f"All CLI models failed: {last_exc}")
 
     def _call(self, system: str, user: str) -> Tuple[str, int, int]:
         """CLI primary (Pro plan, 3.1 Pro), falling back through GEMINI_MODELS via API."""
