@@ -17,6 +17,17 @@ import yfinance as yf
 log = logging.getLogger(__name__)
 
 
+HEARTBEAT_PATH = "/tmp/dowtrade_yf_heartbeat"
+
+
+def _write_heartbeat():
+    try:
+        with open(HEARTBEAT_PATH, "w") as f:
+            f.write(str(int(time.time())))
+    except Exception:
+        pass
+
+
 class YFinancePoller:
     """Polls yfinance for 15m bars and delivers completed ones via on_candle."""
 
@@ -59,6 +70,7 @@ class YFinancePoller:
                 self._last_ts_ms = ts_ms
                 indexed += 1
         log.info("YFinancePoller: indexed %d bars, _last_ts_ms=%d", indexed, self._last_ts_ms)
+        _write_heartbeat()
 
     async def run(self) -> None:
         """Poll yfinance every 60s and deliver any new completed bars."""
@@ -74,6 +86,7 @@ class YFinancePoller:
                 df = await loop.run_in_executor(
                     None, lambda: yf.download(self._ticker, period="1d", interval="15m", progress=False)
                 )
+                _write_heartbeat()
                 if df.empty:
                     continue
                 if hasattr(df.columns, "get_level_values"):

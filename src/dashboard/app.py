@@ -7,6 +7,36 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from src.config import Settings
 from src.db.repo import Database
+from datetime import datetime
+import time as _time
+
+HEARTBEAT_PATH = "/tmp/dowtrade_yf_heartbeat"
+
+def _read_heartbeat():
+    try:
+        with open(HEARTBEAT_PATH) as f:
+            ts = int(f.read().strip())
+            return {"last_poll_ts": ts, "age_sec": int(_time.time()) - ts}
+    except Exception:
+        return {"last_poll_ts": None, "age_sec": None}
+
+def _parse_votes(raw):
+    if not raw:
+        return {}
+    try:
+        v = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(v, dict):
+            return v
+    except Exception:
+        pass
+    return {}
+
+def _bar_ts_human(ts):
+    try:
+        return datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(ts)
+
 
 app = FastAPI(title="DOWTrade Dashboard")
 settings = Settings()
@@ -93,17 +123,40 @@ async def journal(request: Request):
     return templates.TemplateResponse(request=request, name="journal.html", context={"request": request, "journals": rows})
 
 @app.get("/disagreements", response_class=HTMLResponse)
-async def disagreements(request: Request):
+async def disagreements(request: Request, dir: str = "", outcome: str = ""):
     db = get_db()
     rows = db._conn.execute("SELECT * FROM decisions ORDER BY bar_ts DESC LIMIT 100").fetchall()
-    disagreements_list = []
+    out = []
     for r in rows:
-        votes = json.loads(r["raw_votes"]) if r["raw_votes"] else []
-        dirs = [v.get("direction", v.get("trend", "FLAT")) for v in votes] if isinstance(votes, list) else []
-        if len(set(dirs)) > 1:
-            disagreements_list.append(r)
+        d = dict(r)
+        votes = _parse_votes(d.get("raw_votes"))
+        d["haiku"] = votes.get("haiku") if isinstance(votes, dict) else None
+        d["gemini"] = votes.get("gemini") if isinstance(votes, dict) else None
+        d["ds"] = votes.get("ds") if isinstance(votes, dict) else None
+        d["bar_ts_human"] = _bar_ts_human(d.get("bar_ts"))
+        # Filters
+        if dir and (d.get("direction") or "").upper() != dir.upper():
+            continue
+        if outcome == "approved" and d.get("safety_ok") != 1:
+            continue
+        if outcome == "rejected" and d.get("safety_ok") != 0:
+            continue
+        if outcome == "disagree":
+            sigs = []
+            if d["haiku"]: sigs.append((d["haiku"].get("trend") or "").lower())
+            if d["gemini"]:
+                ga = (d["gemini"].get("action") or "").lower()
+                sigs.append("up" if "long" in ga else ("down" if "short" in ga else "flat"))
+            if d["ds"]: sigs.append("approved" if d["ds"].get("approved") else "veto")
+            if len(set(s for s in sigs if s)) <= 1:
+                continue
+        out.append(d)
     db.close()
-    return templates.TemplateResponse(request=request, name="disagreements.html", context={"request": request, "decisions": disagreements_list})
+    return templates.TemplateResponse(
+        request=request,
+        name="disagreements.html",
+        context={"request": request, "decisions": out, "dir_filter": dir, "outcome_filter": outcome},
+    )
 
 @app.get("/api/refresh")
 async def api_refresh():
@@ -145,6 +198,7 @@ async def api_refresh():
         "today_realized": today_realized,
         "last_decision": dict(last_d) if last_d else None,
         "account": account,
+        "heartbeat": _read_heartbeat(),
     }
 
 @app.get("/api/equity")
