@@ -211,11 +211,13 @@ class LiveRunner:
                     
                     guard = final_check(order, state)
                     if guard.approved:
+                        # orders.side CHECK requires BUY/SELL; map from internal long/short.
+                        db_side = "BUY" if order.side == "long" else "SELL"
                         try:
                             self.broker.submit_bracket_order(order)
                             self.db.insert_order({
                                 "ts": str(bar.ts), "decision_id": None, "broker_id": "",
-                                "symbol": order.symbol, "side": order.side, "qty": order.qty,
+                                "symbol": order.symbol, "side": db_side, "qty": order.qty,
                                 "order_type": "bracket", "limit_price": 0.0,
                                 "stop_price": float(order.stop_price or 0.0),
                                 "status": "submitted", "raw_response": "",
@@ -224,10 +226,10 @@ class LiveRunner:
                             log.error(f"Order submission failed: {e}")
                             self.db.insert_order({
                                 "ts": str(bar.ts), "decision_id": None, "broker_id": "",
-                                "symbol": order.symbol, "side": order.side, "qty": order.qty,
+                                "symbol": order.symbol, "side": db_side, "qty": order.qty,
                                 "order_type": "bracket", "limit_price": 0.0,
                                 "stop_price": float(order.stop_price or 0.0),
-                                "status": "rejected", "raw_response": str(e),
+                                "status": "rejected", "raw_response": str(e)[:500],
                             })
                     else:
                         log.info("final_check rejected the order")
@@ -240,7 +242,7 @@ class LiveRunner:
                             "raw_votes": raw_votes,
                             "safety_ok": 0,
                             "safety_notes": f"final_check rejected: {guard.reason}",
-})
+                        })
 
             except CostBudgetExceeded:
                 log.warning("CostBudgetExceeded. Stopping orders for the day.")
