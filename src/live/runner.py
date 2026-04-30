@@ -203,7 +203,7 @@ class LiveRunner:
                         side=side,
                         action=act,
                         qty=pqty,
-                        entry_price=0.0,
+                        entry_price=bar.c,
                         stop_price=gem_stop,
                         atr=atr14,
                         status="pending"
