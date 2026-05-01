@@ -22,8 +22,15 @@ from src.llm.base import CostTracker, CostBudgetExceeded, LLMCallResult
 from src.llm.haiku_structural import HaikuStructural
 from src.llm.gemini_execution import GeminiExecution
 from src.llm.deepseek_risk import DeepSeekRisk
-from src.backtest.harness import final_check, compute_size
+from src.backtest.harness import final_check, compute_size, _PositionState
+from src.broker.models import AccountState, Position
+from zoneinfo import ZoneInfo
 import json
+import uuid
+
+SIM_FILLS = os.environ.get("SIM_FILLS", "1") == "1"
+ET = ZoneInfo("America/New_York")
+
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +59,13 @@ class LiveRunner:
         self._last_day = None
         
         self.candle_queue = asyncio.Queue()
+
+        # Sim-fill state (active when SIM_FILLS=1)
+        self._pos = _PositionState()
+        self._cash: float = 0.0
+        self._start_equity_today: float = 0.0
+        self._realized_pnl_today: float = 0.0
+        self._trade_count: int = 0
 
     def _on_candle(self, symbol: str, candle: dict):
         self.candle_queue.put_nowait(candle)
@@ -94,7 +108,10 @@ class LiveRunner:
             if now.hour >= 17 or self._last_day is None:
                 self._budget_exceeded = False
                 self._last_day = day_str
-                log.info(f"Reset daily state for {day_str}")
+                self._realized_pnl_today = 0.0
+                self._trade_count = 0
+                self._start_equity_today = self._cash
+                log.info("Reset daily state for %s (start_equity=%.2f)", day_str, self._start_equity_today)
 
     async def _process_loop(self):
         while True:
@@ -126,18 +143,66 @@ class LiveRunner:
                     
                 self.window.append(bar)
                 self.db.insert_bar({"ts": str(bar.ts), "open": bar.o, "high": bar.h, "low": bar.l, "close": bar.c, "volume": bar.v})
-                
-                state = self.broker.get_account_state()
-                self.db.insert_equity({
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    "start_equity": state.equity,
-                    "end_equity": state.equity,
-                    "realized_pnl": getattr(state, "realized_pnl_today", 0.0),
-                    "unrealized_pnl": getattr(state, "unrealized_pnl", 0.0),
-                    "commission": 0.0,
-                    "trade_count": 0,
-                })
-                
+
+                # ── Sim stop-check on every bar (before any new decision) ──
+                if SIM_FILLS and not self._pos.is_flat():
+                    stop_hit = False
+                    if self._pos.side == "long" and bar.l <= self._pos.current_stop:
+                        stop_hit = True
+                    elif self._pos.side == "short" and bar.h >= self._pos.current_stop:
+                        stop_hit = True
+                    if stop_hit:
+                        fill_price = self._pos.current_stop
+                        pnl = self._pos.unrealized_pnl(fill_price)
+                        self._cash += pnl
+                        self._realized_pnl_today += pnl
+                        try:
+                            self.db.insert_fill({
+                                "order_id": 0,
+                                "broker_fill_id": "sim-stop-" + str(uuid.uuid4())[:8],
+                                "ts": str(bar.ts),
+                                "qty": self._pos.qty,
+                                "price": fill_price,
+                                "commission": 0.0,
+                            })
+                        except Exception as exc:
+                            log.warning("sim stop-fill insert failed: %s", exc)
+                        log.info("sim STOP HIT %s qty=%d fill=%.2f pnl=%.2f cash=%.2f",
+                                 self._pos.side, self._pos.qty, fill_price, pnl, self._cash)
+                        self._pos = _PositionState()
+                        self._trade_count += 1
+
+                # Build AccountState the LLMs / final_check will see.
+                if SIM_FILLS:
+                    sim_unreal = self._pos.unrealized_pnl(bar.c)
+                    state = AccountState(
+                        equity=self._cash + sim_unreal,
+                        realized_pnl_today=self._realized_pnl_today,
+                        unrealized_pnl=sim_unreal,
+                        position=self._pos.to_broker_position(bar.c),
+                        now_et=datetime.fromtimestamp(bar.ts, tz=ET),
+                    )
+                    self.db.insert_equity({
+                        "date": datetime.now().strftime("%Y-%m-%d"),
+                        "start_equity": self._start_equity_today,
+                        "end_equity": state.equity,
+                        "realized_pnl": self._realized_pnl_today,
+                        "unrealized_pnl": sim_unreal,
+                        "commission": 0.0,
+                        "trade_count": self._trade_count,
+                    })
+                else:
+                    state = self.broker.get_account_state()
+                    self.db.insert_equity({
+                        "date": datetime.now().strftime("%Y-%m-%d"),
+                        "start_equity": state.equity,
+                        "end_equity": state.equity,
+                        "realized_pnl": getattr(state, "realized_pnl_today", 0.0),
+                        "unrealized_pnl": getattr(state, "unrealized_pnl", 0.0),
+                        "commission": 0.0,
+                        "trade_count": 0,
+                    })
+
                 if self._budget_exceeded:
                     continue
 
@@ -211,26 +276,61 @@ class LiveRunner:
                     
                     guard = final_check(order, state)
                     if guard.approved:
-                        # orders.side CHECK requires BUY/SELL; map from internal long/short.
                         db_side = "BUY" if order.side == "long" else "SELL"
-                        try:
-                            self.broker.submit_bracket_order(order)
-                            self.db.insert_order({
-                                "ts": str(bar.ts), "decision_id": None, "broker_id": "",
-                                "symbol": order.symbol, "side": db_side, "qty": order.qty,
-                                "order_type": "bracket", "limit_price": 0.0,
-                                "stop_price": float(order.stop_price or 0.0),
-                                "status": "submitted", "raw_response": "",
-                            })
-                        except Exception as e:
-                            log.error(f"Order submission failed: {e}")
-                            self.db.insert_order({
-                                "ts": str(bar.ts), "decision_id": None, "broker_id": "",
-                                "symbol": order.symbol, "side": db_side, "qty": order.qty,
-                                "order_type": "bracket", "limit_price": 0.0,
-                                "stop_price": float(order.stop_price or 0.0),
-                                "status": "rejected", "raw_response": str(e)[:500],
-                            })
+                        if SIM_FILLS:
+                            if not self._pos.is_flat():
+                                log.info("sim fill skipped: position already open (%s qty=%d)",
+                                         self._pos.side, self._pos.qty)
+                            else:
+                                fill_price = bar.c
+                                try:
+                                    order_id = self.db.insert_order({
+                                        "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
+                                        "symbol": order.symbol, "side": db_side, "qty": order.qty,
+                                        "order_type": "market", "limit_price": 0.0,
+                                        "stop_price": float(order.stop_price or 0.0),
+                                        "status": "filled", "raw_response": "sim-fill at bar.c",
+                                    })
+                                    self.db.insert_fill({
+                                        "order_id": order_id,
+                                        "broker_fill_id": "sim-" + str(uuid.uuid4())[:8],
+                                        "ts": str(bar.ts),
+                                        "qty": order.qty,
+                                        "price": fill_price,
+                                        "commission": 0.0,
+                                    })
+                                except Exception as exc:
+                                    log.error("sim order/fill insert failed: %s", exc)
+                                self._pos = _PositionState(
+                                    side=order.side,
+                                    qty=order.qty,
+                                    avg_price=fill_price,
+                                    current_stop=float(order.stop_price or 0.0),
+                                    pyramid_adds_used=0,
+                                    entry_ts=bar.ts,
+                                )
+                                log.info("sim FILL %s %s qty=%d entry=%.2f stop=%.2f",
+                                         db_side, order.symbol, order.qty, fill_price,
+                                         float(order.stop_price or 0.0))
+                        else:
+                            try:
+                                self.broker.submit_bracket_order(order)
+                                self.db.insert_order({
+                                    "ts": str(bar.ts), "decision_id": None, "broker_id": "",
+                                    "symbol": order.symbol, "side": db_side, "qty": order.qty,
+                                    "order_type": "bracket", "limit_price": 0.0,
+                                    "stop_price": float(order.stop_price or 0.0),
+                                    "status": "submitted", "raw_response": "",
+                                })
+                            except Exception as e:
+                                log.error(f"Order submission failed: {e}")
+                                self.db.insert_order({
+                                    "ts": str(bar.ts), "decision_id": None, "broker_id": "",
+                                    "symbol": order.symbol, "side": db_side, "qty": order.qty,
+                                    "order_type": "bracket", "limit_price": 0.0,
+                                    "stop_price": float(order.stop_price or 0.0),
+                                    "status": "rejected", "raw_response": str(e)[:500],
+                                })
                     else:
                         log.info("final_check rejected the order")
                         self.db.insert_decision({
@@ -253,6 +353,15 @@ class LiveRunner:
     async def start(self):
         log.info("LiveRunner starting...")
         self.broker.connect()
+        try:
+            initial_state = self.broker.get_account_state()
+            self._cash = float(initial_state.equity)
+            self._start_equity_today = self._cash
+            log.info("Sim-fill seed: cash=%.2f from broker", self._cash)
+        except Exception as exc:
+            log.warning("Could not seed sim cash: %s -- defaulting to 1,000,000", exc)
+            self._cash = 1_000_000.0
+            self._start_equity_today = self._cash
         await self._hydrate_window()
         
         if self.USE_YFINANCE:
