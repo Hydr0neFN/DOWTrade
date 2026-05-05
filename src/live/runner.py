@@ -104,6 +104,70 @@ class LiveRunner:
         log.info("Hydrated BarWindow with %d bars", len(self.window))
         self._cross.bulk_load(self.window.as_list())
 
+    def _ensure_sim_table(self):
+        """Create sim_state table if not exists."""
+        import sqlite3
+        conn = sqlite3.connect(self.settings.db_path)
+        conn.execute("""CREATE TABLE IF NOT EXISTS sim_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            cash REAL NOT NULL,
+            pos_side TEXT,
+            pos_qty INTEGER DEFAULT 0,
+            pos_avg_price REAL DEFAULT 0,
+            pos_stop REAL DEFAULT 0,
+            pos_entry_ts INTEGER DEFAULT 0,
+            realized_pnl_today REAL DEFAULT 0,
+            trade_count INTEGER DEFAULT 0,
+            start_equity_today REAL DEFAULT 0,
+            updated_at TEXT
+        )""")
+        conn.commit()
+        conn.close()
+
+    def _save_sim_state(self):
+        """Persist sim state to DB (single-row upsert)."""
+        import sqlite3
+        conn = sqlite3.connect(self.settings.db_path)
+        conn.execute("""INSERT OR REPLACE INTO sim_state
+            (id, cash, pos_side, pos_qty, pos_avg_price, pos_stop, pos_entry_ts,
+             realized_pnl_today, trade_count, start_equity_today, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            (self._cash,
+             self._pos.side if not self._pos.is_flat() else None,
+             self._pos.qty if not self._pos.is_flat() else 0,
+             self._pos.avg_price if not self._pos.is_flat() else 0,
+             self._pos.current_stop if not self._pos.is_flat() else 0,
+             self._pos.entry_ts if not self._pos.is_flat() else 0,
+             self._realized_pnl_today,
+             self._trade_count,
+             self._start_equity_today))
+        conn.commit()
+        conn.close()
+
+    def _load_sim_state(self) -> bool:
+        """Load sim state from DB. Returns True if loaded, False if no saved state."""
+        import sqlite3
+        conn = sqlite3.connect(self.settings.db_path)
+        row = conn.execute("SELECT * FROM sim_state WHERE id=1").fetchone()
+        conn.close()
+        if row is None:
+            return False
+        # row: id, cash, pos_side, pos_qty, pos_avg_price, pos_stop, pos_entry_ts,
+        #      realized_pnl_today, trade_count, start_equity_today, updated_at
+        self._cash = row[1]
+        self._start_equity_today = row[9]
+        self._realized_pnl_today = row[7]
+        self._trade_count = row[8]
+        if row[2]:  # pos_side not None = have position
+            self._pos = _PositionState(
+                side=row[2], qty=row[3], avg_price=row[4],
+                current_stop=row[5], pyramid_adds_used=0, entry_ts=row[6])
+        else:
+            self._pos = _PositionState()
+        log.info("Loaded sim state: cash=%.2f pos=%s qty=%d realized=%.2f",
+                 self._cash, row[2] or "flat", row[3] or 0, self._realized_pnl_today)
+        return True
+
     def _reset_daily_state(self):
         now = datetime.now()
         day_str = now.strftime("%Y-%m-%d")
@@ -175,6 +239,7 @@ class LiveRunner:
                                  self._pos.side, self._pos.qty, fill_price, pnl, self._cash)
                         self._pos = _PositionState()
                         self._trade_count += 1
+                        self._save_sim_state()
 
                 # Build AccountState the LLMs / final_check will see.
                 if SIM_FILLS:
@@ -334,6 +399,7 @@ class LiveRunner:
                                 log.info("sim FILL %s %s qty=%d entry=%.2f stop=%.2f",
                                          db_side, order.symbol, order.qty, fill_price,
                                          float(order.stop_price or 0.0))
+                                self._save_sim_state()
                         else:
                             try:
                                 self.broker.submit_bracket_order(order)
@@ -375,15 +441,20 @@ class LiveRunner:
     async def start(self):
         log.info("LiveRunner starting...")
         self.broker.connect()
-        try:
-            initial_state = self.broker.get_account_state()
-            self._cash = float(initial_state.equity)
-            self._start_equity_today = self._cash
-            log.info("Sim-fill seed: cash=%.2f from broker", self._cash)
-        except Exception as exc:
-            log.warning("Could not seed sim cash: %s -- defaulting to 1,000,000", exc)
-            self._cash = 1_000_000.0
-            self._start_equity_today = self._cash
+        self._ensure_sim_table()
+        if SIM_FILLS and self._load_sim_state():
+            log.info("Sim state restored from DB (cash=%.2f)", self._cash)
+        else:
+            try:
+                initial_state = self.broker.get_account_state()
+                self._cash = float(initial_state.equity)
+                self._start_equity_today = self._cash
+                log.info("Sim-fill seed: cash=%.2f from broker", self._cash)
+            except Exception as exc:
+                log.warning("Could not seed sim cash: %s -- defaulting to 1,000,000", exc)
+                self._cash = 1_000_000.0
+                self._start_equity_today = self._cash
+            self._save_sim_state()
         await self._hydrate_window()
         
         if self.USE_YFINANCE:
