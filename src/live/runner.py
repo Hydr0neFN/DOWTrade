@@ -18,6 +18,7 @@ from src.live.yfinance_poller import YFinancePoller
 
 from src.data.bars import BarWindow
 from src.data.features import MarketSnapshot, build_snapshot
+from src.data.cross_filter import CrossFilter
 from src.llm.base import CostTracker, CostBudgetExceeded, LLMCallResult
 from src.llm.haiku_structural import HaikuStructural
 from src.llm.gemini_execution import GeminiExecution
@@ -66,6 +67,7 @@ class LiveRunner:
         self._start_equity_today: float = 0.0
         self._realized_pnl_today: float = 0.0
         self._trade_count: int = 0
+        self._cross = CrossFilter()
 
     def _on_candle(self, symbol: str, candle: dict):
         self.candle_queue.put_nowait(candle)
@@ -100,6 +102,7 @@ class LiveRunner:
             for b in bars:
                 self.window.append(DataBar(ts=b.ts_utc, o=b.open, h=b.high, l=b.low, c=b.close, v=int(b.volume)))
         log.info("Hydrated BarWindow with %d bars", len(self.window))
+        self._cross.bulk_load(self.window.as_list())
 
     def _reset_daily_state(self):
         now = datetime.now()
@@ -142,6 +145,7 @@ class LiveRunner:
                     continue
                     
                 self.window.append(bar)
+                self._cross.update(bar)
                 self.db.insert_bar({"ts": str(bar.ts), "open": bar.o, "high": bar.h, "low": bar.l, "close": bar.c, "volume": bar.v})
 
                 # ── Sim stop-check on every bar (before any new decision) ──
@@ -261,6 +265,24 @@ class LiveRunner:
                 elif action == "open_short": mapped = ("short", "open")
                 
                 if mapped and ds_res.get("approved"):
+                    # ???? Golden/Death cross filter (dad's rule: ??????????? ????
+                    cross_ok, cross_reason = self._cross.allows(action)
+                    if not cross_ok:
+                        log.info("Cross filter blocked %s: %s", action, cross_reason)
+                        self.db.insert_decision({
+                            "bar_ts": str(bar.ts),
+                            "direction": "FLAT",
+                            "confidence": 0.0,
+                            "stop_price": 0.0,
+                            "entry_price": float(bar.c),
+                            "raw_votes": raw_votes,
+                            "safety_ok": 0,
+                            "safety_notes": cross_reason,
+                        })
+                    else:
+                        log.info("Cross filter passed: %s", cross_reason)
+
+                if mapped and ds_res.get("approved") and self._cross.allows(action)[0]:
                     side, act = mapped
                     order = Order(
                         order_id="",
