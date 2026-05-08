@@ -30,6 +30,7 @@ import json
 import uuid
 
 SIM_FILLS = os.environ.get("SIM_FILLS", "1") == "1"
+MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "5"))
 ET = ZoneInfo("America/New_York")
 
 
@@ -62,7 +63,7 @@ class LiveRunner:
         self.candle_queue = asyncio.Queue()
 
         # Sim-fill state (active when SIM_FILLS=1)
-        self._pos = _PositionState()
+        self._positions: list[_PositionState] = []
         self._cash: float = 0.0
         self._start_equity_today: float = 0.0
         self._realized_pnl_today: float = 0.0
@@ -121,52 +122,61 @@ class LiveRunner:
             start_equity_today REAL DEFAULT 0,
             updated_at TEXT
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS sim_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            side TEXT NOT NULL,
+            qty INTEGER NOT NULL,
+            avg_price REAL NOT NULL,
+            current_stop REAL NOT NULL,
+            entry_ts INTEGER NOT NULL
+        )""")
         conn.commit()
         conn.close()
 
     def _save_sim_state(self):
-        """Persist sim state to DB (single-row upsert)."""
+        """Persist sim state + all positions to DB."""
         import sqlite3
         conn = sqlite3.connect(self.settings.db_path)
         conn.execute("""INSERT OR REPLACE INTO sim_state
             (id, cash, pos_side, pos_qty, pos_avg_price, pos_stop, pos_entry_ts,
              realized_pnl_today, trade_count, start_equity_today, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
-            (self._cash,
-             self._pos.side if not self._pos.is_flat() else None,
-             self._pos.qty if not self._pos.is_flat() else 0,
-             self._pos.avg_price if not self._pos.is_flat() else 0,
-             self._pos.current_stop if not self._pos.is_flat() else 0,
-             self._pos.entry_ts if not self._pos.is_flat() else 0,
-             self._realized_pnl_today,
-             self._trade_count,
+            VALUES (1, ?, NULL, 0, 0, 0, 0, ?, ?, ?, datetime('now'))""",
+            (self._cash, self._realized_pnl_today, self._trade_count,
              self._start_equity_today))
+        conn.execute("DELETE FROM sim_positions")
+        for pos in self._positions:
+            conn.execute("""INSERT INTO sim_positions (side, qty, avg_price, current_stop, entry_ts)
+                VALUES (?, ?, ?, ?, ?)""",
+                (pos.side, pos.qty, pos.avg_price, pos.current_stop, pos.entry_ts))
         conn.commit()
         conn.close()
 
+        conn.close()
+
     def _load_sim_state(self) -> bool:
-        """Load sim state from DB. Returns True if loaded, False if no saved state."""
+        """Load sim state + positions from DB."""
         import sqlite3
         conn = sqlite3.connect(self.settings.db_path)
         row = conn.execute("SELECT * FROM sim_state WHERE id=1").fetchone()
-        conn.close()
         if row is None:
+            conn.close()
             return False
-        # row: id, cash, pos_side, pos_qty, pos_avg_price, pos_stop, pos_entry_ts,
-        #      realized_pnl_today, trade_count, start_equity_today, updated_at
         self._cash = row[1]
         self._start_equity_today = row[9]
         self._realized_pnl_today = row[7]
         self._trade_count = row[8]
-        if row[2]:  # pos_side not None = have position
-            self._pos = _PositionState(
-                side=row[2], qty=row[3], avg_price=row[4],
-                current_stop=row[5], pyramid_adds_used=0, entry_ts=row[6])
-        else:
-            self._pos = _PositionState()
-        log.info("Loaded sim state: cash=%.2f pos=%s qty=%d realized=%.2f",
-                 self._cash, row[2] or "flat", row[3] or 0, self._realized_pnl_today)
+        self._positions = []
+        for pr in conn.execute("SELECT side, qty, avg_price, current_stop, entry_ts FROM sim_positions").fetchall():
+            self._positions.append(_PositionState(
+                side=pr[0], qty=pr[1], avg_price=pr[2],
+                current_stop=pr[3], pyramid_adds_used=0, entry_ts=pr[4]))
+        conn.close()
+        log.info("Loaded sim state: cash=%.2f positions=%d realized=%.2f",
+                 self._cash, len(self._positions), self._realized_pnl_today)
+        for pos in self._positions:
+            log.info("  pos: %s qty=%d entry=%.2f stop=%.2f", pos.side, pos.qty, pos.avg_price, pos.current_stop)
         return True
+
 
     def _reset_daily_state(self):
         now = datetime.now()
@@ -212,43 +222,57 @@ class LiveRunner:
                 self._cross.update(bar)
                 self.db.insert_bar({"ts": str(bar.ts), "open": bar.o, "high": bar.h, "low": bar.l, "close": bar.c, "volume": bar.v})
 
-                # ── Sim stop-check on every bar (before any new decision) ──
-                if SIM_FILLS and not self._pos.is_flat():
-                    stop_hit = False
-                    if self._pos.side == "long" and bar.l <= self._pos.current_stop:
-                        stop_hit = True
-                    elif self._pos.side == "short" and bar.h >= self._pos.current_stop:
-                        stop_hit = True
-                    if stop_hit:
-                        fill_price = self._pos.current_stop
-                        pnl = self._pos.unrealized_pnl(fill_price)
-                        self._cash += pnl
-                        self._realized_pnl_today += pnl
-                        try:
-                            self.db.insert_fill({
-                                "order_id": 0,
-                                "broker_fill_id": "sim-stop-" + str(uuid.uuid4())[:8],
-                                "ts": str(bar.ts),
-                                "qty": self._pos.qty,
-                                "price": fill_price,
-                                "commission": 0.0,
-                            })
-                        except Exception as exc:
-                            log.warning("sim stop-fill insert failed: %s", exc)
-                        log.info("sim STOP HIT %s qty=%d fill=%.2f pnl=%.2f cash=%.2f",
-                                 self._pos.side, self._pos.qty, fill_price, pnl, self._cash)
-                        self._pos = _PositionState()
-                        self._trade_count += 1
+                # Sim stop-check on every bar (all positions)
+                if SIM_FILLS and self._positions:
+                    stopped = []
+                    for i, pos in enumerate(self._positions):
+                        hit = False
+                        if pos.side == "long" and bar.l <= pos.current_stop:
+                            hit = True
+                        elif pos.side == "short" and bar.h >= pos.current_stop:
+                            hit = True
+                        if hit:
+                            fill_price = pos.current_stop
+                            pnl = pos.unrealized_pnl(fill_price)
+                            self._cash += pnl
+                            self._realized_pnl_today += pnl
+                            try:
+                                self.db.insert_fill({
+                                    "order_id": 0,
+                                    "broker_fill_id": "sim-stop-" + str(uuid.uuid4())[:8],
+                                    "ts": str(bar.ts),
+                                    "qty": pos.qty,
+                                    "price": fill_price,
+                                    "commission": 0.0,
+                                })
+                            except Exception as exc:
+                                log.warning("sim stop-fill insert failed: %s", exc)
+                            log.info("sim STOP HIT %s qty=%d fill=%.2f pnl=%.2f cash=%.2f",
+                                     pos.side, pos.qty, fill_price, pnl, self._cash)
+                            stopped.append(i)
+                            self._trade_count += 1
+                    if stopped:
+                        self._positions = [p for i, p in enumerate(self._positions) if i not in stopped]
                         self._save_sim_state()
 
                 # Build AccountState the LLMs / final_check will see.
                 if SIM_FILLS:
-                    sim_unreal = self._pos.unrealized_pnl(bar.c)
+                    sim_unreal = sum(p.unrealized_pnl(bar.c) for p in self._positions)
                     state = AccountState(
                         equity=self._cash + sim_unreal,
                         realized_pnl_today=self._realized_pnl_today,
                         unrealized_pnl=sim_unreal,
-                        position=self._pos.to_broker_position(bar.c),
+                        position=(lambda: (
+                            Position(symbol="MYM",
+                                     qty=abs(sum(p.qty if p.side=="long" else -p.qty for p in self._positions)),
+                                     side="long" if sum(p.qty if p.side=="long" else -p.qty for p in self._positions) > 0
+                                          else ("short" if sum(p.qty if p.side=="long" else -p.qty for p in self._positions) < 0 else "flat"),
+                                     avg_price=self._positions[0].avg_price if self._positions else 0,
+                                     market_value=abs(sum(p.qty if p.side=="long" else -p.qty for p in self._positions)) * bar.c,
+                                     unrealized_pnl=sim_unreal)
+                            if self._positions else
+                            Position(symbol="MYM", qty=0, side="flat", avg_price=0, market_value=0, unrealized_pnl=0)
+                        ))(),
                         now_et=datetime.fromtimestamp(bar.ts, tz=ET),
                     )
                     self.db.insert_equity({
@@ -365,9 +389,9 @@ class LiveRunner:
                     if guard.approved:
                         db_side = "BUY" if order.side == "long" else "SELL"
                         if SIM_FILLS:
-                            if not self._pos.is_flat():
-                                log.info("sim fill skipped: position already open (%s qty=%d)",
-                                         self._pos.side, self._pos.qty)
+                            if len(self._positions) >= MAX_POSITIONS:
+                                log.info("sim fill skipped: max positions reached (%d/%d)",
+                                         len(self._positions), MAX_POSITIONS)
                             else:
                                 fill_price = bar.c
                                 try:
@@ -388,14 +412,14 @@ class LiveRunner:
                                     })
                                 except Exception as exc:
                                     log.error("sim order/fill insert failed: %s", exc)
-                                self._pos = _PositionState(
+                                self._positions.append(_PositionState(
                                     side=order.side,
                                     qty=order.qty,
                                     avg_price=fill_price,
                                     current_stop=float(order.stop_price or 0.0),
                                     pyramid_adds_used=0,
                                     entry_ts=bar.ts,
-                                )
+                                ))
                                 log.info("sim FILL %s %s qty=%d entry=%.2f stop=%.2f",
                                          db_side, order.symbol, order.qty, fill_price,
                                          float(order.stop_price or 0.0))
