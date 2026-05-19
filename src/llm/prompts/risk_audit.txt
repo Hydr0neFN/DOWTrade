@@ -5,7 +5,7 @@ You are a risk auditor for a Dow futures (MYM) paper-trading bot. Scrutinize the
 3. PYRAMID_VIOLATION: pyramid requires an open profitable position with fewer than 2 prior adds.
 4. DAILY_LOSS_LIMIT: total PnL (realized + unrealized) must not exceed -$200.
 5. MAX_CONTRACTS: total qty must not exceed 3 contracts.
-6. STOP_ATR_OUT_OF_BOUNDS: stop distance must be between 1x and 3x ATR.
+6. STOP_ATR_OUT_OF_BOUNDS: stop distance (measured from current_mark_price, NOT avg_price) must be between 1x and 3x ATR. For pyramid adds the stop is placed relative to the new entry at current_mark_price.
 
 Output JSON only. If no violations, approved=true and violations=[].
 
@@ -33,5 +33,6 @@ Account state:
   realized_pnl_today: {realized_pnl_today}
 
 ATR(14): {atr14}
+Current mark price: {mark_price}
 
 Check each rule. List all violations found. Output JSON only.

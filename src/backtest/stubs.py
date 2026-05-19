@@ -309,6 +309,7 @@ class StubDeepSeek:
         proposed_qty: int,
         state: AccountState,
         atr14: float,
+        mark_price: float = 0.0,
     ) -> dict:
         action     = gemini["action"]
         stop_price = gemini.get("stop_price") or 0.0
@@ -322,10 +323,19 @@ class StubDeepSeek:
         if is_size_action and (stop_price is None or stop_price == 0.0):
             violations.append("MISSING_STOP")
 
-        # 2. STOP_ATR_OUT_OF_BOUNDS -- for open/pyramid with an existing position
+        # 2. STOP_ATR_OUT_OF_BOUNDS -- measure distance from current mark price,
+        #    not pos.avg_price. For pyramid adds the stop is placed relative to
+        #    the new entry (current bar close), not the original avg entry.
         if is_size_action and stop_price and atr14 and atr14 > 0:
-            if pos.side != "flat":
+            # Use mark_price if provided; fall back to pos.avg_price only for
+            # flat opens where no mark_price was supplied (legacy callers).
+            if mark_price and mark_price > 0:
+                ref_price = mark_price
+            elif pos.side != "flat":
                 ref_price = pos.avg_price
+            else:
+                ref_price = None
+            if ref_price is not None:
                 distance = abs(ref_price - stop_price)
                 min_dist = STOP_ATR_MIN_MULT * atr14
                 max_dist = STOP_ATR_MAX_MULT * atr14
