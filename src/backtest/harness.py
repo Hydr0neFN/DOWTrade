@@ -11,7 +11,7 @@ import time as _time_mod
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Literal, Optional, Tuple
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from src.backtest.stubs import StubDeepSeek, StubGemini, StubHaiku
@@ -39,15 +39,15 @@ class BacktestConfig:
     db_path: str = ":memory:"
     mode: Literal["stub", "live-llm"] = "stub"
     warmup_bars: int = 200
-    write_equity_png: Optional[str] = None
-    write_trades_csv: Optional[str] = None
+    write_equity_png: str | None = None
+    write_trades_csv: str | None = None
 
 
 @dataclass
 class BacktestResult:
     config: BacktestConfig
-    equity_curve: List[Tuple[int, float]]
-    trades: List[dict]
+    equity_curve: list[tuple[int, float]]
+    trades: list[dict]
     stats: dict
     safety_overrides: int
     decisions_count: int
@@ -105,7 +105,7 @@ def _session_date_key(ts: int) -> str:
 def run_backtest(cfg: BacktestConfig) -> BacktestResult:
     t0 = _time_mod.monotonic()
 
-    all_bars: List[Bar] = read_csv(cfg.csv_path)
+    all_bars: list[Bar] = read_csv(cfg.csv_path)
     if not all_bars:
         raise ValueError(f"No bars loaded from {cfg.csv_path}")
 
@@ -117,8 +117,8 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
     realized_pnl_today: float = 0.0
     current_session_key: str = ""
 
-    equity_curve: List[Tuple[int, float]] = []
-    trades: List[dict] = []
+    equity_curve: list[tuple[int, float]] = []
+    trades: list[dict] = []
     safety_overrides: int = 0
     decisions_count: int = 0
 
@@ -266,7 +266,7 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
                         _sz = compute_size(entry=mark_price, stop=_fb)
                     _pqty = _sz.contracts if _sz.contracts > 0 else 0
                     deepseek_result = _live_deepseek.evaluate(
-                        gemini, max(_pqty, 1), state, atr14, bar_ts=bar.ts
+                        gemini, max(_pqty, 1), state, atr14, bar_ts=bar.ts, mark_price=mark_price
                     )
                     _total_llm_cost_usd = _live_tracker.total_usd
                     deepseek = deepseek_result.parsed or {
@@ -297,7 +297,7 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
 
         if cfg.mode != "live-llm":
             deepseek = deepseek_stub.evaluate(
-                gemini, max(proposed_qty, 1), state, atr14
+                gemini, max(proposed_qty, 1), state, atr14, mark_price=mark_price
             )
 
         gemini_action = gemini.get("action", "hold")
@@ -321,7 +321,7 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
 
         raw_votes = json.dumps({"haiku": haiku, "gemini": gemini, "deepseek": deepseek})
 
-        proposed: Optional[ProposedOrder] = None
+        proposed: ProposedOrder | None = None
         guard_approved = False
         safety_notes = "hold - no action"
 

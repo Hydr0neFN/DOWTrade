@@ -322,7 +322,7 @@ class LiveRunner:
                     sz = compute_size(entry=mark_price, stop=fb)
                 pqty = max(sz.contracts if sz.contracts > 0 else 0, 1)
 
-                ds_result = self.deepseek.evaluate(gemini_res, pqty, state, atr14, bar_ts=bar.ts)
+                ds_result = self.deepseek.evaluate(gemini_res, pqty, state, atr14, bar_ts=bar.ts, mark_price=mark_price)
                 ds_res = ds_result.parsed or {"approved": False, "violations": ["PARSE_ERROR"], "override_action": "hold"}
                 
                 action = gemini_res.get("action", "hold")

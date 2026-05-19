@@ -95,9 +95,12 @@ class DeepSeekRisk(LLMClient):
         atr14: float,
         *,
         bar_ts: int,
+        mark_price: float = 0.0,
     ) -> LLMCallResult:
         """
         Build risk audit prompt from execution decision + account state and call DeepSeek.
+        mark_price is the current bar close — used by the LLM to correctly measure
+        stop distance for pyramid adds (stop is relative to new entry, not avg_price).
         """
         system, user = render_prompt(
             self._prompt_path,
@@ -114,5 +117,6 @@ class DeepSeekRisk(LLMClient):
             equity=state.equity,
             realized_pnl_today=state.realized_pnl_today,
             atr14=atr14,
+            mark_price=mark_price,
         )
         return self.evaluate_raw(system, user, bar_ts=bar_ts)
