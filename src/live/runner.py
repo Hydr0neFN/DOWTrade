@@ -352,6 +352,7 @@ class LiveRunner:
                 mapped = None
                 if action == "open_long": mapped = ("long", "open")
                 elif action == "open_short": mapped = ("short", "open")
+                elif action == "close": mapped = ("close", "close")
                 
                 if mapped and ds_res.get("approved"):
                     # ???? Golden/Death cross filter (dad's rule: ??????????? ????
@@ -370,6 +371,88 @@ class LiveRunner:
                         })
                     else:
                         log.info("Cross filter passed: %s", cross_reason)
+
+                # --- close handler (no cross-filter, no final_check needed) ---
+                if action == "close" and ds_res.get("approved") and SIM_FILLS and self._positions:
+                    for pos in list(self._positions):
+                        fill_price = bar.c
+                        pnl = pos.unrealized_pnl(fill_price)
+                        self._cash += pnl
+                        self._realized_pnl_today += pnl
+                        self._trade_count += 1
+                        db_close_side = "BUY" if pos.side == "short" else "SELL"
+                        try:
+                            close_order_id = self.db.insert_order({
+                                "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
+                                "symbol": "MYM", "side": db_close_side, "qty": pos.qty,
+                                "order_type": "market", "limit_price": 0.0,
+                                "stop_price": 0.0,
+                                "status": "filled", "raw_response": "sim-close at bar.c",
+                            })
+                            self.db.insert_fill({
+                                "order_id": close_order_id,
+                                "broker_fill_id": "sim-close-" + str(uuid.uuid4())[:8],
+                                "ts": str(bar.ts),
+                                "qty": pos.qty,
+                                "price": fill_price,
+                                "commission": 0.0,
+                            })
+                        except Exception as exc:
+                            log.error("sim close order/fill insert failed: %s", exc)
+                        log.info("sim CLOSE %s qty=%d fill=%.2f pnl=%.2f cash=%.2f",
+                                 pos.side, pos.qty, fill_price, pnl, self._cash)
+                    self._positions = []
+                    self._save_sim_state()
+
+                # --- add_pyramid handler ---
+                if action == "add_pyramid" and ds_res.get("approved") and SIM_FILLS \
+                        and self._positions and len(self._positions) < MAX_POSITIONS:
+                    pyramid_side = "long" if action == "open_long" else (
+                        "short" if action == "open_short" else self._positions[0].side
+                    )
+                    # Only add if same side as existing positions
+                    if pyramid_side == self._positions[0].side:
+                        cross_ok_pyr, cross_reason_pyr = self._cross.allows(
+                            "open_long" if pyramid_side == "long" else "open_short"
+                        )
+                        if not cross_ok_pyr:
+                            log.info("add_pyramid blocked by cross filter: %s", cross_reason_pyr)
+                        else:
+                            fill_price = bar.c
+                            pyr_stop = float(gem_stop or 0.0)
+                            pyr_db_side = "BUY" if pyramid_side == "long" else "SELL"
+                            try:
+                                pyr_order_id = self.db.insert_order({
+                                    "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
+                                    "symbol": "MYM", "side": pyr_db_side, "qty": pqty,
+                                    "order_type": "market", "limit_price": 0.0,
+                                    "stop_price": pyr_stop,
+                                    "status": "filled", "raw_response": "sim-pyramid at bar.c",
+                                })
+                                self.db.insert_fill({
+                                    "order_id": pyr_order_id,
+                                    "broker_fill_id": "sim-pyr-" + str(uuid.uuid4())[:8],
+                                    "ts": str(bar.ts),
+                                    "qty": pqty,
+                                    "price": fill_price,
+                                    "commission": 0.0,
+                                })
+                            except Exception as exc:
+                                log.error("sim pyramid order/fill insert failed: %s", exc)
+                            self._positions.append(_PositionState(
+                                side=pyramid_side,
+                                qty=pqty,
+                                avg_price=fill_price,
+                                current_stop=pyr_stop,
+                                pyramid_adds_used=0,
+                                entry_ts=bar.ts,
+                            ))
+                            log.info("sim PYRAMID %s qty=%d entry=%.2f stop=%.2f positions=%d",
+                                     pyr_db_side, pqty, fill_price, pyr_stop, len(self._positions))
+                            self._save_sim_state()
+                    else:
+                        log.info("add_pyramid skipped: existing side=%s would conflict",
+                                 self._positions[0].side)
 
                 if mapped and ds_res.get("approved") and self._cross.allows(action)[0]:
                     side, act = mapped
