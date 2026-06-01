@@ -42,3 +42,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+bot.db
+bot.db-shm
+bot.db-wal

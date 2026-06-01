@@ -7,7 +7,7 @@ Usage:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 
 from src.backtest.synthetic import SyntheticConfig, generate_bars, write_csv
 
@@ -24,8 +24,8 @@ def main() -> None:
 
     write_csv(bars, OUTPUT_PATH)
 
-    first_ts = datetime.fromtimestamp(bars[0].ts, tz=timezone.utc).isoformat()
-    last_ts  = datetime.fromtimestamp(bars[-1].ts, tz=timezone.utc).isoformat()
+    first_ts = datetime.fromtimestamp(bars[0].ts, tz=datetime.UTC).isoformat()
+    last_ts  = datetime.fromtimestamp(bars[-1].ts, tz=datetime.UTC).isoformat()
     min_close = min(b.c for b in bars)
     max_close = max(b.c for b in bars)
 

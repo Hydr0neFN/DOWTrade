@@ -11,9 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import sys
 
 
 def main() -> None:
