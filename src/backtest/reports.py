@@ -6,25 +6,28 @@ Report generation: equity-curve PNG and trades CSV.
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timezone
-from typing import List, Tuple
+from datetime import datetime
 from zoneinfo import ZoneInfo
+
+try:
+    import matplotlib
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    matplotlib.use("Agg")          # non-interactive backend
+except ImportError:
+    pass
 
 ET = ZoneInfo("America/New_York")
 
 
 def write_equity_curve_png(
-    equity_curve: List[Tuple[int, float]],
+    equity_curve: list[tuple[int, float]],
     path: str,
 ) -> None:
     """
     Write a single-panel equity curve plot to *path* (PNG).
     x-axis = datetime (UTC -> ET), y-axis = equity USD.
     """
-    import matplotlib
-    matplotlib.use("Agg")          # non-interactive backend
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
 
     if not equity_curve:
         return
@@ -53,7 +56,7 @@ def write_equity_curve_png(
     plt.close(fig)
 
 
-def write_trades_csv(trades: List[dict], path: str) -> None:
+def write_trades_csv(trades: list[dict], path: str) -> None:
     """Write closed round-trip trades to a CSV file."""
     if not trades:
         # Write header-only file
