@@ -1,82 +1,98 @@
-# DOWTrade Bot
+# DOWTrade
 
-Paper-trading bot for Micro E-mini Dow futures (MYM) on Tradovate demo.
+Paper-trading bot for Micro E-mini Dow futures (**MYM**). A three-LLM analysis
+pipeline proposes trades; a hard-coded Python safety layer has the final word
+before any order is placed.
 
-## Purpose
+> **Paper-only.** `PAPER_ONLY=True` and `BROKER_ENV="demo"` are hard-coded in
+> `src/config.py` and asserted at startup — the process refuses to run outside a
+> sandbox. No real money, no profitability claims. A learning/research scaffold.
 
-Automates a disciplined trading process informed by the philosophy encoded in
-`~/DOWTrade/交易修煉克服人性駕馭趨勢-01..12.png` (12 pages of trading wisdom).
-Three LLMs independently analyze market data and vote on trade decisions; a
-Python safety layer acts as the hard override before any order is submitted.
+## Pipeline (per 15-minute bar)
 
-## Non-Objectives
+```
+yfinance bar ─▶ feature extraction (ATR-14, SMA-200, Donchian-20, swings)
+            │
+            ▼
+   1. Haiku (Anthropic)      — market regime / structural read
+   2. Gemini (via gemini-cli) — action: open_long | open_short | close | add_pyramid | hold
+   3. DeepSeek (HF)          — risk approval + violations
+            │
+            ▼
+   4. Python final_check     — HARD override (daily-loss, size, stop, ATR bounds)
+   5. Golden/Death cross gate — SMA 20/50 on 15m AND 1hr must agree before entry
+            │
+            ▼
+   sim-fill (paper) ─▶ SQLite ─▶ FastAPI dashboard
+```
 
-- This system is **paper-only** — no real money, no live brokerage integration.
-- No profitability claims are made; the bot is a learning and research scaffold.
-- Does not attempt to predict markets or guarantee consistent returns.
+The Python layer is the single source of truth for safety. No LLM, env var, or
+config file can override the rails in `src/config.py`.
 
-## Philosophy Source
+## Key features
 
-The 12 PDF images in `~/DOWTrade/` (filenames
-`交易修煉克服人性駕馭趨勢-01.png` through `交易修煉克服人性駕馭趨勢-12.png`)
-encode the trading philosophy: trend-following, strict risk management, and
-overcoming psychological biases. All safety constants in `src/config.py` are
-derived from these principles.
+- **Three-LLM ensemble** — Haiku (structural), Gemini (execution, via `gemini-cli`
+  with a Pro→Flash fallback chain), DeepSeek/Qwen (risk). Each call is logged.
+- **Hard safety layer** — `final_check` enforces max daily loss ($200), fixed risk
+  per trade ($50), max open contracts, mandatory stop-loss, ATR-bounded stops,
+  no averaging down, flat-before-weekend.
+- **Golden/death cross filter** — entries require SMA 20/50 cross agreement on both
+  the 15m and 1hr timeframes (trend-following discipline).
+- **Sim-fills** — `SIM_FILLS=1` synthesizes fills locally at bar close and tracks up
+  to 5 concurrent positions, persisted across restarts in `sim_state` /
+  `sim_positions` tables (the broker's cert sandbox cannot fill orders).
+- **Dashboard** — FastAPI + Jinja2: equity, day P&L, per-LLM reasoning cards, and a
+  yfinance heartbeat to detect silent stalls.
+- **Daily journal** — APScheduler writes an end-of-day review.
 
-## Three-LLM + Python-Safety Pipeline
+## Market data & broker
 
-Each 15-minute bar triggers three independent LLM calls — Claude (Anthropic),
-Gemini (Google), and a Hugging Face open model — each returning a structured
-decision (direction, stop, size reasoning). A Python majority-vote aggregator
-reconciles the three signals; the Python safety layer then enforces hard limits
-on daily loss, position size, stop placement, and paper-only mode before any
-order is sent to Tradovate demo.
+- **Data:** yfinance 15m `MYM=F` bars (polled every 60s). dxLink streaming exists as
+  a fallback but the cert account has no live-data entitlement.
+- **Broker:** Tastytrade certification sandbox. Order submission is stubbed by
+  sim-fills because the sandbox rejects order placement for this account.
 
-## Build Phases
-
-1. **Phase 1 — Scaffolding**: project skeleton, database schema, safety config.
-2. **Phase 2 — Data pipeline**: 15-min bar ingestion and feature extraction.
-3. **Phase 3 — Broker integration**: Tradovate demo auth, order placement, fills.
-4. **Phase 4 — LLM decision layer**: prompt design and three-model voting.
-5. **Phase 5 — Safety & sizing**: guard checks, ATR-based stops, risk-unit sizing.
-6. **Phase 6 — Dashboard & journal**: FastAPI dashboard, trade journaling, review.
-
-## Running Tests
+## Setup
 
 ```bash
-cd ~/DOWTrade/trading-bot
-python -m pytest
-# or with coverage
+pip install -e ".[dev]"
+cp .env.example .env        # fill in API keys + cert credentials
+```
+
+Required in `.env`: `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `HUGGINGFACE_API_KEY`,
+and the `TASTYTRADE_CERT_*` sandbox credentials. See `.env.example`.
+
+## Run
+
+```bash
+python -m src.main          # starts LiveRunner + dashboard on :8000
+```
+
+## Tests
+
+```bash
+python -m pytest                                   # all tests
 python -m pytest --cov=src --cov-report=term-missing
 ```
 
-## Directory Tree
+## Layout
 
 ```
-trading-bot/
-├── pyproject.toml
-├── .env.example
-├── .gitignore
-├── README.md
-├── data/                   # SQLite DB (gitignored)
-├── logs/                   # Runtime logs (gitignored)
-├── journal/                # Trade journal markdown (gitignored)
-├── src/
-│   ├── config.py           # Safety rails + env settings (HARD-CODED)
-│   ├── db/
-│   │   ├── schema.sql      # SQLite schema
-│   │   └── repo.py         # Repository pattern, no ORM
-│   ├── broker/             # Tradovate demo API client
-│   ├── data/               # Bar ingestion and feature extraction
-│   ├── llm/                # Claude, Gemini, HF decision callers
-│   │   └── prompts/        # Prompt templates
-│   ├── safety/             # Hard-limit guard layer
-│   ├── sizing/             # Risk-unit position sizing
-│   ├── journal/            # Trade journaling logic
-│   ├── dashboard/          # FastAPI + Jinja2 dashboard
-│   │   ├── static/
-│   │   └── templates/
-│   └── backtest/           # Backtest harness
-└── tests/
-    └── conftest.py
+src/
+├── config.py            # HARD-CODED safety rails + env Settings
+├── main.py              # entrypoint: LiveRunner thread + uvicorn dashboard
+├── live/
+│   ├── runner.py        # bar loop, LLM pipeline, sim-fills, cross gate
+│   └── yfinance_poller.py
+├── llm/                 # haiku_structural, gemini_execution, deepseek_risk
+│   └── prompts/
+├── data/                # bars, features, cross_filter
+├── broker/              # tastytrade client, models
+├── safety/              # guard layer
+├── sizing/              # risk-unit position sizing
+├── db/                  # schema.sql + repo (raw sqlite, no ORM)
+├── dashboard/           # FastAPI + Jinja2
+├── journal/             # daily review (APScheduler)
+└── backtest/            # harness: final_check, compute_size, _PositionState
+tests/
 ```
