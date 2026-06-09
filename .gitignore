@@ -45,3 +45,6 @@ Thumbs.db
 bot.db
 bot.db-shm
 bot.db-wal
+
+# Root-level runtime logs
+*.log
