@@ -48,3 +48,7 @@ bot.db-wal
 
 # Root-level runtime logs
 *.log
+
+# Local tooling artifacts
+.serena/
+graphify-out/
