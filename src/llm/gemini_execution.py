@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "execution.txt"
 
 GEMINI_MODELS = [
+    "gemini-3.5-flash",
     "gemini-3.1-pro-preview",
     "gemini-3-pro-preview",
     "gemini-3.1-flash-lite-preview",
@@ -41,7 +42,7 @@ GEMINI_CLI_PATH    = os.environ.get("GEMINI_CLI_PATH", "/usr/bin/gemini")
 # When Pro quota exhausts, the loop drops to Flash automatically (separate quota).
 # Override with GEMINI_CLI_MODELS env var (comma-separated). Singular
 # GEMINI_CLI_MODEL still respected for backward compat.
-_default_cli_chain = "gemini-3.1-pro-preview,gemini-3-pro-preview,gemini-3-flash-preview,gemini-2.5-flash"
+_default_cli_chain = "gemini-3.5-flash,gemini-3.1-pro-preview,gemini-3-pro-preview,gemini-3-flash-preview,gemini-2.5-flash"
 _legacy_single = os.environ.get("GEMINI_CLI_MODEL")
 GEMINI_CLI_MODELS = [
     m.strip() for m in os.environ.get("GEMINI_CLI_MODELS", _legacy_single or _default_cli_chain).split(",")
