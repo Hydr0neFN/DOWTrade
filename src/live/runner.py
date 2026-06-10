@@ -232,13 +232,32 @@ class LiveRunner:
                         elif pos.side == "short" and bar.h >= pos.current_stop:
                             hit = True
                         if hit:
-                            fill_price = pos.current_stop
+                            # Model a gap-through: if the bar opened beyond the
+                            # stop, fill at the open (the realistic price), not the
+                            # stop, so paper P&L isn't optimistically biased.
+                            if pos.side == "long":
+                                fill_price = min(pos.current_stop, bar.o)
+                            else:
+                                fill_price = max(pos.current_stop, bar.o)
                             pnl = pos.unrealized_pnl(fill_price)
                             self._cash += pnl
                             self._realized_pnl_today += pnl
+                            # fills.order_id is NOT NULL REFERENCES orders(id) with
+                            # foreign_keys=ON, so order_id=0 raised IntegrityError and
+                            # the stop exit was silently dropped from the DB (dashboard
+                            # kept showing the closed position as open). Insert a
+                            # closing order first and reference its id.
+                            stop_db_side = "BUY" if pos.side == "short" else "SELL"
                             try:
+                                stop_order_id = self.db.insert_order({
+                                    "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
+                                    "symbol": "MYM", "side": stop_db_side, "qty": pos.qty,
+                                    "order_type": "market", "limit_price": 0.0,
+                                    "stop_price": float(pos.current_stop),
+                                    "status": "filled", "raw_response": "sim-stop exit",
+                                })
                                 self.db.insert_fill({
-                                    "order_id": 0,
+                                    "order_id": stop_order_id,
                                     "broker_fill_id": "sim-stop-" + str(uuid.uuid4())[:8],
                                     "ts": str(bar.ts),
                                     "qty": pos.qty,
@@ -258,21 +277,31 @@ class LiveRunner:
                 # Build AccountState the LLMs / final_check will see.
                 if SIM_FILLS:
                     sim_unreal = sum(p.unrealized_pnl(bar.c) for p in self._positions)
+                    # Aggregate the open lots into a single Position for the LLMs
+                    # and final_check. Position has fields (side, qty, avg_price,
+                    # unrealized_pnl, pyramid_adds_used) ONLY — no symbol/market_value.
+                    # Use GROSS qty so _check_max_contracts can't be fooled by
+                    # opposite-side lots netting out.
+                    if self._positions:
+                        net = sum(p.qty if p.side == "long" else -p.qty for p in self._positions)
+                        agg_side = "long" if net > 0 else ("short" if net < 0 else "flat")
+                        agg_pos = Position(
+                            side=agg_side,
+                            qty=sum(p.qty for p in self._positions),
+                            avg_price=self._positions[0].avg_price,
+                            unrealized_pnl=sim_unreal,
+                            pyramid_adds_used=sum(p.pyramid_adds_used for p in self._positions),
+                        )
+                    else:
+                        agg_pos = Position(
+                            side="flat", qty=0, avg_price=0.0,
+                            unrealized_pnl=0.0, pyramid_adds_used=0,
+                        )
                     state = AccountState(
                         equity=self._cash + sim_unreal,
                         realized_pnl_today=self._realized_pnl_today,
                         unrealized_pnl=sim_unreal,
-                        position=(lambda: (
-                            Position(symbol="MYM",
-                                     qty=abs(sum(p.qty if p.side=="long" else -p.qty for p in self._positions)),
-                                     side="long" if sum(p.qty if p.side=="long" else -p.qty for p in self._positions) > 0
-                                          else ("short" if sum(p.qty if p.side=="long" else -p.qty for p in self._positions) < 0 else "flat"),
-                                     avg_price=self._positions[0].avg_price if self._positions else 0,
-                                     market_value=abs(sum(p.qty if p.side=="long" else -p.qty for p in self._positions)) * bar.c,
-                                     unrealized_pnl=sim_unreal)
-                            if self._positions else
-                            Position(symbol="MYM", qty=0, side="flat", avg_price=0, market_value=0, unrealized_pnl=0)
-                        ))(),
+                        position=agg_pos,
                         now_et=datetime.fromtimestamp(bar.ts, tz=ET),
                     )
                     self.db.insert_equity({
@@ -313,33 +342,43 @@ class LiveRunner:
                 gemini_result = self.gemini.evaluate(haiku_res, snapshot, state.position, state.equity, bar_ts=bar.ts)
                 gemini_res = gemini_result.parsed or {"action": "hold", "stop_price": 0.0, "trailing_stop_atr_multiple": 2.0}
                 
+                action = gemini_res.get("action", "hold")
                 gem_stop = gemini_res.get("stop_price") or 0.0
                 mark_price = bar.c
                 if gem_stop:
-                    sz = compute_size(entry=mark_price, stop=gem_stop)
+                    order_stop = gem_stop
                 else:
-                    fb = mark_price - atr14 * 2.0
-                    sz = compute_size(entry=mark_price, stop=fb)
-                pqty = max(sz.contracts if sz.contracts > 0 else 0, 1)
+                    # Side-aware fallback stop: a short's protective stop sits
+                    # ABOVE entry. The old code always used entry-2*ATR, so shorts
+                    # with no Gemini stop were always rejected by final_check.
+                    if action == "open_short":
+                        order_stop = mark_price + atr14 * 2.0
+                    else:
+                        order_stop = mark_price - atr14 * 2.0
+                sz = compute_size(entry=mark_price, stop=order_stop)
+                # exec_qty is the risk-disciplined size: 0 means "skip — one
+                # contract would risk more than the fixed budget". pqty (min 1) is
+                # only an advisory quantity for the DeepSeek prompt.
+                exec_qty = sz.contracts if sz.contracts > 0 else 0
+                pqty = max(exec_qty, 1)
 
                 ds_result = self.deepseek.evaluate(gemini_res, pqty, state, atr14, bar_ts=bar.ts, mark_price=mark_price)
                 ds_res = ds_result.parsed or {"approved": False, "violations": ["PARSE_ERROR"], "override_action": "hold"}
-                
-                action = gemini_res.get("action", "hold")
+
                 _dir_map = {"open_long": "LONG", "open_short": "SHORT"}
                 direction = _dir_map.get(action, "FLAT")
                 raw_votes = json.dumps({"haiku": haiku_res, "gemini": gemini_res, "ds": ds_res})
                 decision = {
                     "bar_ts": bar.ts,
                     "action": action,
-                    "reasoning": f"Haiku {haiku_res.get('regime')}, Gemini {action}, DS approved={ds_res.get('approved')}",
+                    "reasoning": f"Haiku {haiku_res.get('trend')}, Gemini {action}, DS approved={ds_res.get('approved')}",
                     "disagreement_flags": {"haiku": haiku_res, "gemini": gemini_res, "ds": ds_res}
                 }
 
                 self.db.insert_decision({
                     "bar_ts": str(bar.ts),
                     "direction": direction,
-                    "confidence": float(haiku_res.get("confidence", 0.5) or 0.5),
+                    "confidence": float(haiku_res.get("confidence_0_to_1", 0.5) or 0.5),
                     "stop_price": float(gem_stop or 0.0),
                     "entry_price": float(bar.c),
                     "raw_votes": raw_votes,
@@ -407,10 +446,10 @@ class LiveRunner:
                 # --- add_pyramid handler ---
                 if action == "add_pyramid" and ds_res.get("approved") and SIM_FILLS \
                         and self._positions and len(self._positions) < MAX_POSITIONS:
-                    pyramid_side = "long" if action == "open_long" else (
-                        "short" if action == "open_short" else self._positions[0].side
-                    )
-                    # Only add if same side as existing positions
+                    # A pyramid always adds to the existing position's side (this
+                    # block only runs for action=="add_pyramid", so the old
+                    # open_long/open_short arms were dead code).
+                    pyramid_side = self._positions[0].side
                     if pyramid_side == self._positions[0].side:
                         cross_ok_pyr, cross_reason_pyr = self._cross.allows(
                             "open_long" if pyramid_side == "long" else "open_short"
@@ -454,16 +493,24 @@ class LiveRunner:
                         log.info("add_pyramid skipped: existing side=%s would conflict",
                                  self._positions[0].side)
 
-                if mapped and ds_res.get("approved") and self._cross.allows(action)[0]:
+                # Only the OPEN path builds an Order/final_check here; close and
+                # add_pyramid are fully handled by their own blocks above. Without
+                # this guard, action=="close" (mapped=("close","close")) fell
+                # through and built Order(side="close"), inserting a phantom SELL
+                # and a garbage side="close" position.
+                if mapped and mapped[1] == "open" and ds_res.get("approved") and self._cross.allows(action)[0]:
                     side, act = mapped
+                    if exec_qty < 1:
+                        log.info("skip %s: risk-unit size is 0 (stop too wide for $ budget)", action)
+                        continue
                     order = Order(
                         order_id="",
                         symbol="MYM",
                         side=side,
                         action=act,
-                        qty=pqty,
+                        qty=exec_qty,
                         entry_price=bar.c,
-                        stop_price=gem_stop,
+                        stop_price=order_stop,
                         atr=atr14,
                         status="pending"
                     )
