@@ -99,7 +99,7 @@ class GeminiExecution(LLMClient):
         for model in GEMINI_CLI_MODELS:
             try:
                 proc = subprocess.run(
-                    [GEMINI_CLI_PATH, "-m", model, "-o", "json", "-y", "-p", full_prompt],
+                    [GEMINI_CLI_PATH, "-m", model, "-o", "json", "--approval-mode", "plan", "-p", full_prompt],
                     capture_output=True, text=True, timeout=GEMINI_CLI_TIMEOUT,
                 )
                 if proc.returncode != 0:
