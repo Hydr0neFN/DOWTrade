@@ -398,11 +398,16 @@ class LiveRunner:
                     cross_ok, cross_reason = self._cross.allows(action)
                     if not cross_ok:
                         log.info("Cross filter blocked %s: %s", action, cross_reason)
+                        # decisions.bar_ts is UNIQUE + INSERT OR REPLACE, so this
+                        # overwrites the row inserted above. Preserve the real
+                        # direction/confidence/votes (don't zero them) and only
+                        # mark it blocked, or the /disagreements audit loses the
+                        # very LLM votes it exists to record.
                         self.db.insert_decision({
                             "bar_ts": str(bar.ts),
-                            "direction": "FLAT",
-                            "confidence": 0.0,
-                            "stop_price": 0.0,
+                            "direction": direction,
+                            "confidence": float(haiku_res.get("confidence_0_to_1", 0.5) or 0.5),
+                            "stop_price": float(gem_stop or 0.0),
                             "entry_price": float(bar.c),
                             "raw_votes": raw_votes,
                             "safety_ok": 0,
@@ -575,11 +580,13 @@ class LiveRunner:
                                 })
                     else:
                         log.info("final_check rejected the order")
+                        # Preserve the real direction/votes; only record the reject
+                        # reason (see the cross-filter note above re: OR REPLACE).
                         self.db.insert_decision({
                             "bar_ts": str(bar.ts),
-                            "direction": "FLAT",
-                            "confidence": 0.0,
-                            "stop_price": 0.0,
+                            "direction": direction,
+                            "confidence": float(haiku_res.get("confidence_0_to_1", 0.5) or 0.5),
+                            "stop_price": float(gem_stop or 0.0),
                             "entry_price": float(bar.c),
                             "raw_votes": raw_votes,
                             "safety_ok": 0,

@@ -214,17 +214,24 @@ class LLMClient(ABC):
             )
         latency_ms = int((time.monotonic() - t0) * 1000)
 
+        # The API was already hit, so tokens were spent regardless of whether the
+        # response parses. Record that spend on the failure paths too, or the
+        # budget cap (MAX_LLM_SPEND_USD) can be bypassed by a model that keeps
+        # returning malformed/partial JSON.
+        actual_cost = self._actual_cost_usd(in_tok, out_tok)
+
         # Step 3: parse JSON
         parsed = parse_json_strict(raw)
         if parsed is None:
             log.warning("[%s] JSON parse failed. raw[:200]=%s", self.name, raw[:200])
+            self._tracker.record(actual_cost)
             return LLMCallResult(
                 parsed=dict(self.safe_default),
                 raw_response=raw[:500],
                 latency_ms=latency_ms,
                 input_tokens=in_tok,
                 output_tokens=out_tok,
-                cost_usd=0.0,
+                cost_usd=actual_cost,
                 error="json_parse_failed",
                 used_fallback=True,
                 model_used=getattr(self, '_last_model', self.name),
@@ -234,13 +241,14 @@ class LLMClient(ABC):
         missing = self.schema_keys - parsed.keys()
         if missing:
             log.warning("[%s] Missing schema keys: %s", self.name, missing)
+            self._tracker.record(actual_cost)
             return LLMCallResult(
                 parsed=dict(self.safe_default),
                 raw_response=raw[:500],
                 latency_ms=latency_ms,
                 input_tokens=in_tok,
                 output_tokens=out_tok,
-                cost_usd=0.0,
+                cost_usd=actual_cost,
                 error=f"missing_keys:{missing}",
                 used_fallback=True,
                 model_used=getattr(self, '_last_model', self.name),
