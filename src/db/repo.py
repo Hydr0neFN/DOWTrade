@@ -36,6 +36,13 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
+        # The runner thread and the dashboard's per-request connections write to
+        # the same file. WAL allows concurrent readers but only one writer; with
+        # the default busy_timeout=0 a second writer hits SQLITE_BUSY immediately
+        # ("database is locked"), which the runner's broad except swallows
+        # (dropping that bar's persistence). Wait up to 5s for the lock instead.
+        self._conn.execute("PRAGMA busy_timeout=5000;")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._apply_schema()
 
     # ------------------------------------------------------------------
