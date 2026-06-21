@@ -11,11 +11,12 @@ before any order is placed.
 ## Pipeline (per 15-minute bar)
 
 ```
-yfinance bar ─▶ feature extraction (ATR-14, SMA-200, Donchian-20, swings)
+yfinance ^DJI bar ─▶ feature extraction (ATR-14, SMA-200, Donchian-20, swings)
             │
             ▼
-   1. Haiku (Anthropic)      — market regime / structural read
-   2. Gemini (via gemini-cli) — action: open_long | open_short | close | add_pyramid | hold
+   1. Claude (Anthropic)     — structural read. Sonnet via subscription SDK on
+                               crucial bars (position open), else Haiku API
+   2. Gemini (API)           — action: open_long | open_short | close | add_pyramid | hold
    3. DeepSeek (HF)          — risk approval + violations
             │
             ▼
@@ -31,8 +32,13 @@ config file can override the rails in `src/config.py`.
 
 ## Key features
 
-- **Three-LLM ensemble** — Haiku (structural), Gemini (execution, via `gemini-cli`
-  with a Pro→Flash fallback chain), DeepSeek/Qwen (risk). Each call is logged.
+- **Three-LLM ensemble** — Claude (structural; **Sonnet** via the Claude Agent SDK
+  on the free subscription credit for crucial bars, **Haiku** API otherwise and as
+  fallback), Gemini (execution, via the Gemini **API** — Google retired the
+  individual-tier `gemini-cli` on 2026-06-18, so it is off by default),
+  DeepSeek/Qwen (risk). Each call is logged. The ~$20/mo credit is shared with the
+  sibling `trader` bot via `~/.claude_sdk_credit.json`; on depletion everything
+  falls back to the metered Haiku API.
 - **Hard safety layer** — `final_check` enforces max daily loss ($200), fixed risk
   per trade ($50), max open contracts, mandatory stop-loss, ATR-bounded stops,
   no averaging down, flat-before-weekend.
@@ -47,8 +53,12 @@ config file can override the rails in `src/config.py`.
 
 ## Market data & broker
 
-- **Data:** yfinance 15m `MYM=F` bars (polled every 60s). dxLink streaming exists as
-  a fallback but the cert account has no live-data entitlement.
+- **Data:** yfinance 15m `^DJI` (Dow index) bars (polled every 60s), configurable via
+  `YF_DATA_SYMBOL` / `YF_HYDRATE_PERIOD`. The index is roll-proof; the previous
+  `MYM=F` micro-future continuous symbol went dark at the **2026-06-19 quarterly
+  futures roll** and stalled the bot, so the structural feed now reads the index
+  (orders are still placed as **MYM** on the broker). dxLink streaming exists as a
+  fallback but the cert account has no live-data entitlement.
 - **Broker:** Tastytrade certification sandbox. Order submission is stubbed by
   sim-fills because the sandbox rejects order placement for this account.
 
@@ -61,6 +71,13 @@ cp .env.example .env        # fill in API keys + cert credentials
 
 Required in `.env`: `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `HUGGINGFACE_API_KEY`,
 and the `TASTYTRADE_CERT_*` sandbox credentials. See `.env.example`.
+
+**Optional — Claude Sonnet via subscription.** To run the structural judge on Claude
+**Sonnet** through the Claude Agent SDK (free ~$20/mo subscription credit instead of
+metered Haiku API tokens), add `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`).
+Tunables: `DOWTRADE_SDK_FOR` (`positions` [default — Sonnet only while holding a live
+position] | `all` | `none`), `CLAUDE_SDK_MONTHLY_CAP_USD` (default `20`),
+`CLAUDE_SDK_MODEL` (default `sonnet`). With no token the bot runs Haiku-only, as before.
 
 ## Run
 
