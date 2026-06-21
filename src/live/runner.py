@@ -345,7 +345,8 @@ class LiveRunner:
                 snapshot = build_snapshot(self.window.as_list())
                 atr14 = snapshot.atr14 or 1.0
 
-                haiku_result = self.haiku.evaluate(snapshot, bar_ts=bar.ts)
+                _crucial = len(getattr(self, "_positions", []) or []) > 0
+                haiku_result = self.haiku.evaluate(snapshot, bar_ts=bar.ts, crucial=_crucial)
                 haiku_res = haiku_result.parsed
                 if haiku_res is None:
                     haiku_res = dict(self.haiku.safe_default)

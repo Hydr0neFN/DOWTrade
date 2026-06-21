@@ -102,6 +102,21 @@ def sdk_available() -> bool:
     return SDK_ENABLED and bool(OAUTH_TOKEN) and _spent() < CAP_USD
 
 
+# Which structural calls may use Sonnet: all | positions | none.
+# Default 'positions' — concentrate the free credit on CRUCIAL bars (those where
+# a live position is open and being managed); routine flat-market scans stay on
+# Haiku so the free ~$20/mo lasts and is spent where judgment matters.
+SDK_SCOPE = os.environ.get("DOWTRADE_SDK_FOR", "positions").lower()
+
+
+def scope_allows(crucial: bool) -> bool:
+    if SDK_SCOPE == "all":
+        return True
+    if SDK_SCOPE == "none":
+        return False
+    return crucial
+
+
 def sdk_complete(system: str, user: str, max_tokens: int = 400) -> tuple:
     """One-shot Claude Sonnet call via the `claude` CLI (subscription auth).
 

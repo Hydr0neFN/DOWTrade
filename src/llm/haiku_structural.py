@@ -16,7 +16,7 @@ from anthropic import Anthropic
 from src.config import LLM_TIMEOUT_SEC
 from src.data.features import MarketSnapshot
 from src.llm.base import LLMCallResult, LLMClient, CostTracker, render_prompt
-from src.llm.claude_sdk import sdk_available, sdk_complete
+from src.llm.claude_sdk import sdk_available, sdk_complete, scope_allows
 
 log = logging.getLogger(__name__)
 
@@ -62,8 +62,9 @@ class HaikuStructural(LLMClient):
         self._last_model = "claude-haiku-4-5-20251001"
 
     def _call(self, system: str, user: str) -> Tuple[str, int, int]:
-        # Primary: Claude Sonnet via the subscription SDK (the $20 credit).
-        if sdk_available():
+        # Primary: Claude Sonnet via the subscription SDK (the $20 credit), but
+        # only on crucial bars (see DOWTRADE_SDK_FOR / the `crucial` flag).
+        if sdk_available() and scope_allows(getattr(self, "_crucial", False)):
             try:
                 raw, in_tok, out_tok, _cost = sdk_complete(system, user, max_tokens=400)
                 self._last_model = "sonnet-sdk"
@@ -103,11 +104,15 @@ class HaikuStructural(LLMClient):
         snapshot: MarketSnapshot,
         *,
         bar_ts: int,
+        crucial: bool = False,
     ) -> LLMCallResult:
         """
-        Build prompt from snapshot and call Haiku.
+        Build prompt from snapshot and call the model.
+        `crucial=True` (e.g. a live position is open) routes this call to Sonnet
+        under DOWTRADE_SDK_FOR='positions'; otherwise it stays on Haiku.
         Returns LLMCallResult with parsed structural analysis.
         """
+        self._crucial = crucial
         bars_csv = "\n".join(
             f"{b.ts},{b.o},{b.h},{b.l},{b.c},{b.v}"
             for b in snapshot.bars[-40:]
