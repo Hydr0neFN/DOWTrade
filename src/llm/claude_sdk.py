@@ -60,6 +60,15 @@ CREDIT_FILE = Path(os.environ.get(
 # Sonnet 4.x list pricing (USD/token) — used to value subscription usage against
 # the monthly cap when the CLI reports total_cost_usd == 0 (subscription mode).
 SONNET_IN_USD, SONNET_OUT_USD = 3e-6, 15e-6
+# Prepended to every SDK system prompt. The `claude` CLI is an agentic harness,
+# not a raw API: without this it adds conversational preamble or refuses the
+# task, which breaks JSON parsing and forces the caller's safe_default.
+_SDK_HARDENING = (
+    "You are a deterministic JSON-only function inside an automated pipeline, "
+    "not an interactive assistant. You have no tools and take no actions; you only "
+    "classify the data provided. Never refuse, never add preamble or commentary, "
+    "never mention being an AI. Output exactly one JSON object and nothing else.\n\n"
+)
 
 
 def _month() -> str:
@@ -107,10 +116,11 @@ def sdk_complete(system: str, user: str, max_tokens: int = 400) -> tuple:
     proc = subprocess.run(
         [CLI_PATH, "-p", user,
          "--model", SDK_MODEL,
-         "--system-prompt", system,
+         "--system-prompt", _SDK_HARDENING + system,
          "--output-format", "json",
          "--max-turns", "1",
          "--allowedTools", "",
+         "--strict-mcp-config",
          "--no-session-persistence",
          "--permission-mode", "default"],
         capture_output=True, text=True, timeout=SDK_TIMEOUT, cwd="/tmp", env=env,
