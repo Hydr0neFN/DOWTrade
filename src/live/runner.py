@@ -33,6 +33,17 @@ SIM_FILLS = os.environ.get("SIM_FILLS", "1") == "1"
 MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "5"))
 ET = ZoneInfo("America/New_York")
 
+# Bar/structure data symbol for the yfinance feed. Default '^DJI' (Dow index):
+# unlike the 'MYM=F' micro-future continuous symbol, the index never rolls, so
+# the feed does not die at quarterly futures expiry (which stalled the bot on
+# 2026-06-19). Orders are still placed as MYM via the tastytrade broker; this
+# only changes the price/structure bars the strategy reads.
+YF_DATA_SYMBOL = os.environ.get("YF_DATA_SYMBOL", "^DJI")
+# Initial history pull. '^DJI' is RTH-only (~26 bars/day), so fetch enough days
+# to seed sma200 (needs 200 bars ≈ 8 RTH days). 20d gives headroom and stays
+# within yfinance's 60-day cap for 15m bars.
+YF_HYDRATE_PERIOD = os.environ.get("YF_HYDRATE_PERIOD", "20d")
+
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +88,7 @@ class LiveRunner:
         if self.USE_YFINANCE:
             loop = asyncio.get_event_loop()
             df = await loop.run_in_executor(
-                None, lambda: yf.download("MYM=F", period="5d", interval="15m", progress=False)
+                None, lambda: yf.download(YF_DATA_SYMBOL, period=YF_HYDRATE_PERIOD, interval="15m", progress=False)
             )
             if not df.empty:
                 if hasattr(df.columns, "get_level_values"):
@@ -619,9 +630,9 @@ class LiveRunner:
         await self._hydrate_window()
         
         if self.USE_YFINANCE:
-            self.streamer = YFinancePoller("MYM=F", self._on_candle)
+            self.streamer = YFinancePoller(YF_DATA_SYMBOL, self._on_candle)
             await self.streamer.connect()
-            await self.streamer.subscribe_candles("MYM=F", "15m", from_time_ms=0)
+            await self.streamer.subscribe_candles(YF_DATA_SYMBOL, "15m", from_time_ms=0)
         else:
             token_data = self.broker.get_dxlink_token()
             self.streamer = DxLinkStreamer(
