@@ -16,6 +16,7 @@ from anthropic import Anthropic
 from src.config import LLM_TIMEOUT_SEC
 from src.data.features import MarketSnapshot
 from src.llm.base import LLMCallResult, LLMClient, CostTracker, render_prompt
+from src.llm.claude_sdk import sdk_available, sdk_complete
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +62,16 @@ class HaikuStructural(LLMClient):
         self._last_model = "claude-haiku-4-5-20251001"
 
     def _call(self, system: str, user: str) -> Tuple[str, int, int]:
+        # Primary: Claude Sonnet via the subscription SDK (the $20 credit).
+        if sdk_available():
+            try:
+                raw, in_tok, out_tok, _cost = sdk_complete(system, user, max_tokens=400)
+                self._last_model = "sonnet-sdk"
+                return raw, in_tok, out_tok
+            except Exception as exc:
+                log.warning("[haiku] SDK path failed (%s) — falling back to Haiku API",
+                            str(exc)[:160])
+        # Fallback: metered Anthropic API on Haiku.
         msg = self._client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
@@ -68,13 +79,17 @@ class HaikuStructural(LLMClient):
             messages=[{"role": "user", "content": user}],
             timeout=LLM_TIMEOUT_SEC,
         )
+        self._last_model = "claude-haiku-4-5-20251001"
         raw = msg.content[0].text.strip()
         in_tok = msg.usage.input_tokens + getattr(msg.usage, "cache_read_input_tokens", 0)
         out_tok = msg.usage.output_tokens
         return raw, in_tok, out_tok
 
     def _actual_cost_usd(self, in_tok: int, out_tok: int) -> float:
-        # Haiku 4.5 pricing placeholder: $1/M input, $5/M output
+        # Sonnet (subscription SDK path) vs Haiku (API fallback) pricing.
+        if getattr(self, "_last_model", "") == "sonnet-sdk":
+            return in_tok * 3e-6 + out_tok * 15e-6
+        # Haiku 4.5: $1/M input, $5/M output
         return in_tok * 1e-6 + out_tok * 5e-6
 
     def _estimated_cost_usd(self, prompt_chars: int) -> float:

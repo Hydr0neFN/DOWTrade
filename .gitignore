@@ -52,3 +52,6 @@ bot.db-wal
 # Local tooling artifacts
 .serena/
 graphify-out/
+
+# Local backups
+*.bak-*
