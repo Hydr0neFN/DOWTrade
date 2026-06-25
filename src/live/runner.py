@@ -398,14 +398,17 @@ class LiveRunner:
                     "safety_notes": str(ds_res.get("violations", [])),
 })
                 
-                # We only execute if DeepSeek approved and action is an open/close
-                # For simplicity, we just check open_long/open_short as in original runner
+                # DeepSeek is ADVISORY now: it is still recorded in raw_votes /
+                # safety_ok for the /disagreements audit, but it no longer gates
+                # execution. Its rules only re-checked guards.py's deterministic
+                # safety layer. Execution is gated by the cross-filter +
+                # guards.final_check (open) and a direct profitability check (pyramid).
                 mapped = None
                 if action == "open_long": mapped = ("long", "open")
                 elif action == "open_short": mapped = ("short", "open")
                 elif action == "close": mapped = ("close", "close")
                 
-                if mapped and ds_res.get("approved"):
+                if mapped:
                     # ???? Golden/Death cross filter (dad's rule: ??????????? ????
                     cross_ok, cross_reason = self._cross.allows(action)
                     if not cross_ok:
@@ -429,7 +432,7 @@ class LiveRunner:
                         log.info("Cross filter passed: %s", cross_reason)
 
                 # --- close handler (no cross-filter, no final_check needed) ---
-                if action == "close" and ds_res.get("approved") and SIM_FILLS and self._positions:
+                if action == "close" and SIM_FILLS and self._positions:
                     for pos in list(self._positions):
                         fill_price = bar.c
                         pnl = pos.unrealized_pnl(fill_price)
@@ -461,8 +464,12 @@ class LiveRunner:
                     self._save_sim_state()
 
                 # --- add_pyramid handler ---
-                if action == "add_pyramid" and ds_res.get("approved") and SIM_FILLS \
-                        and self._positions and len(self._positions) < MAX_POSITIONS:
+                # DeepSeek demoted to advisory: gate the pyramid add on a DETERMINISTIC
+                # profitability check (never add to a losing position) instead of the
+                # LLM vote — same rule guards._check_pyramid / NO_AVERAGING_DOWN enforce.
+                if action == "add_pyramid" and SIM_FILLS \
+                        and self._positions and len(self._positions) < MAX_POSITIONS \
+                        and self._positions[0].unrealized_pnl(bar.c) > 0:
                     # A pyramid always adds to the existing position's side (this
                     # block only runs for action=="add_pyramid", so the old
                     # open_long/open_short arms were dead code).
@@ -515,7 +522,7 @@ class LiveRunner:
                 # this guard, action=="close" (mapped=("close","close")) fell
                 # through and built Order(side="close"), inserting a phantom SELL
                 # and a garbage side="close" position.
-                if mapped and mapped[1] == "open" and ds_res.get("approved") and self._cross.allows(action)[0]:
+                if mapped and mapped[1] == "open" and self._cross.allows(action)[0]:
                     side, act = mapped
                     if exec_qty < 1:
                         log.info("skip %s: risk-unit size is 0 (stop too wide for $ budget)", action)
