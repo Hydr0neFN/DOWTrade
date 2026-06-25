@@ -140,13 +140,15 @@ class Database:
         return cur.lastrowid  # type: ignore[return-value]
 
     def get_decisions_for_day(self, date_str: str) -> list[sqlite3.Row]:
-        """Return all decisions whose bar_ts starts with date_str (YYYY-MM-DD)."""
-        sql = """
-            SELECT * FROM decisions
-            WHERE bar_ts LIKE ?
-            ORDER BY bar_ts ASC
-        """
-        return self._conn.execute(sql, (f"{date_str}%",)).fetchall()
+        """Return all decisions on the ET calendar day date_str. bar_ts is stored
+        as UNIX-epoch-second strings (Bar.ts is epoch), so range-scan the day's
+        epoch window rather than LIKE-matching a date prefix that never appears."""
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=ZoneInfo("America/New_York"))
+        lo, hi = str(int(day.timestamp())), str(int((day + timedelta(days=1)).timestamp()))
+        sql = "SELECT * FROM decisions WHERE bar_ts >= ? AND bar_ts < ? ORDER BY bar_ts ASC"
+        return self._conn.execute(sql, (lo, hi)).fetchall()
 
     # ------------------------------------------------------------------
     # orders
