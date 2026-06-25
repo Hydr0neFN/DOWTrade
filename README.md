@@ -17,7 +17,7 @@ yfinance ^DJI bar ─▶ feature extraction (ATR-14, SMA-200, Donchian-20, swing
    1. Claude (Anthropic)     — structural read. Sonnet via subscription SDK on
                                crucial bars (position open), else Haiku API
    2. Gemini (API)           — action: open_long | open_short | close | add_pyramid | hold
-   3. DeepSeek (HF)          — risk approval + violations
+   3. DeepSeek (HF)          — advisory risk audit (recorded for /disagreements; non-blocking)
             │
             ▼
    4. Python final_check     — HARD override (daily-loss, size, stop, ATR bounds)
@@ -33,12 +33,13 @@ config file can override the rails in `src/config.py`.
 ## Key features
 
 - **Three-LLM ensemble** — Claude (structural; **Sonnet** via the Claude Agent SDK
-  on the free subscription credit for crucial bars, **Haiku** API otherwise and as
+  on your Pro plan's included usage for crucial bars, **Haiku** API otherwise and as
   fallback), Gemini (execution, via the Gemini **API** — Google retired the
   individual-tier `gemini-cli` on 2026-06-18, so it is off by default),
-  DeepSeek/Qwen (risk). Each call is logged. The ~$20/mo credit is shared with the
-  sibling `trader` bot via `~/.claude_sdk_credit.json`; on depletion everything
-  falls back to the metered Haiku API.
+  DeepSeek/Qwen (**advisory** risk audit). Each call is logged. DeepSeek's verdict is
+  recorded for the `/disagreements` view but no longer gates execution — the
+  deterministic `final_check` rails are the sole safety authority. With no
+  subscription token everything runs on the metered Haiku API.
 - **Hard safety layer** — `final_check` enforces max daily loss ($200), fixed risk
   per trade ($50), max open contracts, mandatory stop-loss, ATR-bounded stops,
   no averaging down, flat-before-weekend.
