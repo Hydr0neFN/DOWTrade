@@ -15,17 +15,24 @@ def generate_daily_journal(date_str: str, db: Database, anthropic_client=None) -
         settings = Settings()
         anthropic_client = Anthropic(api_key=settings.anthropic_api_key)
         
-    bars = db._conn.execute("SELECT * FROM bars WHERE ts LIKE ? ORDER BY ts", (f"{date_str}%",)).fetchall()
+    # bars/orders/fills store ts as UNIX-epoch-second strings (Bar.ts is epoch),
+    # so a `LIKE 'YYYY-MM-DD%'` scan never matches — range-scan the ET day's epoch
+    # window instead (10-digit epoch strings sort lexicographically as integers).
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    _day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=ZoneInfo("America/New_York"))
+    _lo, _hi = str(int(_day.timestamp())), str(int((_day + timedelta(days=1)).timestamp()))
+    bars = db._conn.execute("SELECT * FROM bars WHERE ts >= ? AND ts < ? ORDER BY ts", (_lo, _hi)).fetchall()
     decisions = db.get_decisions_for_day(date_str)
-    orders = db._conn.execute("SELECT * FROM orders WHERE ts LIKE ?", (f"{date_str}%",)).fetchall()
-    fills = db._conn.execute("SELECT * FROM fills WHERE ts LIKE ?", (f"{date_str}%",)).fetchall()
+    orders = db._conn.execute("SELECT * FROM orders WHERE ts >= ? AND ts < ?", (_lo, _hi)).fetchall()
+    fills = db._conn.execute("SELECT * FROM fills WHERE ts >= ? AND ts < ?", (_lo, _hi)).fetchall()
     equity = db._conn.execute("SELECT * FROM equity WHERE date=?", (date_str,)).fetchone()
     
     trades_taken = len(set(f["order_id"] for f in fills))
     
-    win_rate = 0.0
-    if trades_taken > 0:
-        win_rate = 0.5 
+    # Per-trade P&L isn't persisted (fills store only price/qty/commission), so a
+    # real win rate can't be computed here — report it as unavailable, not a fake 0.5.
+    win_rate = "n/a"
     
     realized_pnl = equity["realized_pnl"] if equity else 0.0
     unrealized_pnl = equity["unrealized_pnl"] if equity else 0.0
