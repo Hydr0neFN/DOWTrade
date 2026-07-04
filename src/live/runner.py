@@ -23,8 +23,9 @@ from src.llm.base import CostTracker, CostBudgetExceeded, LLMCallResult
 from src.llm.haiku_structural import HaikuStructural
 from src.llm.gemini_execution import GeminiExecution
 from src.llm.deepseek_risk import DeepSeekRisk
-from src.backtest.harness import final_check, compute_size, _PositionState
+from src.backtest.harness import final_check, compute_size, _PositionState, _update_trailing_stop
 from src.broker.models import AccountState, Position
+from src.config import MAX_OPEN_CONTRACTS, MAX_PYRAMID_ADDS, WEEKEND_FLAT_DAY
 from zoneinfo import ZoneInfo
 import json
 import uuid
@@ -190,16 +191,51 @@ class LiveRunner:
 
 
     def _reset_daily_state(self):
-        now = datetime.now()
-        day_str = now.strftime("%Y-%m-%d")
+        # Trading day = ET calendar date. Bars are RTH-only (^DJI), so an ET
+        # date change can only be observed between sessions. The old version
+        # used the HOST's local clock plus an `hour >= 17` gate, which on a
+        # UTC host reset the daily-loss window at 13:00 ET — mid-session —
+        # effectively doubling MAX_DAILY_LOSS_USD for the day.
+        day_str = datetime.now(ET).strftime("%Y-%m-%d")
         if self._last_day != day_str:
-            if now.hour >= 17 or self._last_day is None:
-                self._budget_exceeded = False
-                self._last_day = day_str
-                self._realized_pnl_today = 0.0
-                self._trade_count = 0
-                self._start_equity_today = self._cash
-                log.info("Reset daily state for %s (start_equity=%.2f)", day_str, self._start_equity_today)
+            self._budget_exceeded = False
+            self._last_day = day_str
+            self._realized_pnl_today = 0.0
+            self._trade_count = 0
+            self._start_equity_today = self._cash
+            log.info("Reset daily state for %s (start_equity=%.2f)", day_str, self._start_equity_today)
+
+    def _sim_close_all(self, bar: DataBar, reason: str) -> None:
+        """Market-close every sim position at bar.c (Gemini close / weekend flat)."""
+        for pos in list(self._positions):
+            fill_price = bar.c
+            pnl = pos.unrealized_pnl(fill_price)
+            self._cash += pnl
+            self._realized_pnl_today += pnl
+            self._trade_count += 1
+            db_close_side = "BUY" if pos.side == "short" else "SELL"
+            try:
+                close_order_id = self.db.insert_order({
+                    "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
+                    "symbol": "MYM", "side": db_close_side, "qty": pos.qty,
+                    "order_type": "market", "limit_price": 0.0,
+                    "stop_price": 0.0,
+                    "status": "filled", "raw_response": f"sim-close at bar.c ({reason})",
+                })
+                self.db.insert_fill({
+                    "order_id": close_order_id,
+                    "broker_fill_id": "sim-close-" + str(uuid.uuid4())[:8],
+                    "ts": str(bar.ts),
+                    "qty": pos.qty,
+                    "price": fill_price,
+                    "commission": 0.0,
+                })
+            except Exception as exc:
+                log.error("sim close order/fill insert failed: %s", exc)
+            log.info("sim CLOSE (%s) %s qty=%d fill=%.2f pnl=%.2f cash=%.2f",
+                     reason, pos.side, pos.qty, fill_price, pnl, self._cash)
+        self._positions = []
+        self._save_sim_state()
 
     async def _process_loop(self):
         while True:
@@ -285,6 +321,19 @@ class LiveRunner:
                         self._positions = [p for i, p in enumerate(self._positions) if i not in stopped]
                         self._save_sim_state()
 
+                # HARD RAIL: FLAT_BEFORE_WEEKEND. guards.py only BLOCKS new opens
+                # after the Friday cutoff — nothing ever closed what was already
+                # open, so positions silently carried the weekend gap. Bars are
+                # RTH-only (^DJI), so the 15:45 ET bar (15:45–16:00) is the last
+                # one on Friday: flatten on it and skip decisioning for the bar.
+                # (config WEEKEND_FLAT_TIME_ET=16:45 targets the futures session;
+                # with RTH-only data the last observable bar is 15:45.)
+                if SIM_FILLS and self._positions:
+                    bar_et = datetime.fromtimestamp(bar.ts, tz=ET)
+                    if bar_et.weekday() == WEEKEND_FLAT_DAY and (bar_et.hour, bar_et.minute) >= (15, 45):
+                        self._sim_close_all(bar, reason="weekend-flat")
+                        continue
+
                 # Build AccountState the LLMs / final_check will see.
                 if SIM_FILLS:
                     sim_unreal = sum(p.unrealized_pnl(bar.c) for p in self._positions)
@@ -301,7 +350,11 @@ class LiveRunner:
                             qty=sum(p.qty for p in self._positions),
                             avg_price=self._positions[0].avg_price,
                             unrealized_pnl=sim_unreal,
-                            pyramid_adds_used=sum(p.pyramid_adds_used for p in self._positions),
+                            # Lots-as-adds model: per-lot pyramid_adds_used is
+                            # always 0, so summing it always reported 0 adds to
+                            # the LLMs. Lot count minus the initial entry is the
+                            # real number of adds.
+                            pyramid_adds_used=max(0, len(self._positions) - 1),
                         )
                     else:
                         agg_pos = Position(
@@ -316,7 +369,7 @@ class LiveRunner:
                         now_et=datetime.fromtimestamp(bar.ts, tz=ET),
                     )
                     self.db.insert_equity({
-                        "date": datetime.now().strftime("%Y-%m-%d"),
+                        "date": datetime.now(ET).strftime("%Y-%m-%d"),
                         "start_equity": self._start_equity_today,
                         "end_equity": state.equity,
                         "realized_pnl": self._realized_pnl_today,
@@ -327,7 +380,7 @@ class LiveRunner:
                 else:
                     state = self.broker.get_account_state()
                     self.db.insert_equity({
-                        "date": datetime.now().strftime("%Y-%m-%d"),
+                        "date": datetime.now(ET).strftime("%Y-%m-%d"),
                         "start_equity": state.equity,
                         "end_equity": state.equity,
                         "realized_pnl": getattr(state, "realized_pnl_today", 0.0),
@@ -344,6 +397,22 @@ class LiveRunner:
                     
                 snapshot = build_snapshot(self.window.as_list())
                 atr14 = snapshot.atr14 or 1.0
+
+                # Trailing-stop maintenance. This was backtest-only (_update_
+                # trailing_stop lived in the harness loop): live sim positions
+                # kept their entry stop forever, silently diverging from every
+                # backtest result. Same swing-based ratchet, checked per bar;
+                # the tightened stop is enforced by next bar's stop-check.
+                if SIM_FILLS and self._positions:
+                    trailed = False
+                    for pos in self._positions:
+                        old_stop = pos.current_stop
+                        _update_trailing_stop(pos, snapshot, atr14)
+                        if pos.current_stop != old_stop:
+                            log.info("sim TRAIL %s stop %.2f -> %.2f", pos.side, old_stop, pos.current_stop)
+                            trailed = True
+                    if trailed:
+                        self._save_sim_state()
 
                 _crucial = len(getattr(self, "_positions", []) or []) > 0
                 haiku_result = self.haiku.evaluate(snapshot, bar_ts=bar.ts, crucial=_crucial)
@@ -433,48 +502,34 @@ class LiveRunner:
 
                 # --- close handler (no cross-filter, no final_check needed) ---
                 if action == "close" and SIM_FILLS and self._positions:
-                    for pos in list(self._positions):
-                        fill_price = bar.c
-                        pnl = pos.unrealized_pnl(fill_price)
-                        self._cash += pnl
-                        self._realized_pnl_today += pnl
-                        self._trade_count += 1
-                        db_close_side = "BUY" if pos.side == "short" else "SELL"
-                        try:
-                            close_order_id = self.db.insert_order({
-                                "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
-                                "symbol": "MYM", "side": db_close_side, "qty": pos.qty,
-                                "order_type": "market", "limit_price": 0.0,
-                                "stop_price": 0.0,
-                                "status": "filled", "raw_response": "sim-close at bar.c",
-                            })
-                            self.db.insert_fill({
-                                "order_id": close_order_id,
-                                "broker_fill_id": "sim-close-" + str(uuid.uuid4())[:8],
-                                "ts": str(bar.ts),
-                                "qty": pos.qty,
-                                "price": fill_price,
-                                "commission": 0.0,
-                            })
-                        except Exception as exc:
-                            log.error("sim close order/fill insert failed: %s", exc)
-                        log.info("sim CLOSE %s qty=%d fill=%.2f pnl=%.2f cash=%.2f",
-                                 pos.side, pos.qty, fill_price, pnl, self._cash)
-                    self._positions = []
-                    self._save_sim_state()
+                    self._sim_close_all(bar, reason="gemini-close")
 
                 # --- add_pyramid handler ---
                 # DeepSeek demoted to advisory: gate the pyramid add on a DETERMINISTIC
                 # profitability check (never add to a losing position) instead of the
                 # LLM vote — same rule guards._check_pyramid / NO_AVERAGING_DOWN enforce.
                 if action == "add_pyramid" and SIM_FILLS \
-                        and self._positions and len(self._positions) < MAX_POSITIONS \
+                        and self._positions \
                         and self._positions[0].unrealized_pnl(bar.c) > 0:
                     # A pyramid always adds to the existing position's side (this
-                    # block only runs for action=="add_pyramid", so the old
-                    # open_long/open_short arms were dead code).
+                    # block only runs for action=="add_pyramid").
+                    # HARD RAILS enforced here because this path bypasses
+                    # final_check: the old gate only capped LOT count against
+                    # env MAX_POSITIONS (default 5) — MAX_OPEN_CONTRACTS and
+                    # MAX_PYRAMID_ADDS from config's safety block were never
+                    # applied live, and fills used pqty (floored to 1) even
+                    # when risk sizing said 0 contracts.
                     pyramid_side = self._positions[0].side
-                    if pyramid_side == self._positions[0].side:
+                    gross_qty = sum(p.qty for p in self._positions)
+                    adds_used = len(self._positions) - 1
+                    if exec_qty < 1:
+                        log.info("add_pyramid skipped: risk-unit size is 0 (stop too wide for $ budget)")
+                    elif adds_used >= MAX_PYRAMID_ADDS:
+                        log.info("add_pyramid skipped: MAX_PYRAMID_ADDS (%d) reached", MAX_PYRAMID_ADDS)
+                    elif gross_qty + exec_qty > MAX_OPEN_CONTRACTS:
+                        log.info("add_pyramid skipped: %d+%d would exceed MAX_OPEN_CONTRACTS (%d)",
+                                 gross_qty, exec_qty, MAX_OPEN_CONTRACTS)
+                    else:
                         cross_ok_pyr, cross_reason_pyr = self._cross.allows(
                             "open_long" if pyramid_side == "long" else "open_short"
                         )
@@ -482,12 +537,22 @@ class LiveRunner:
                             log.info("add_pyramid blocked by cross filter: %s", cross_reason_pyr)
                         else:
                             fill_price = bar.c
-                            pyr_stop = float(gem_stop or 0.0)
+                            # MANDATORY_STOP_LOSS: a 0.0 stop is never hit
+                            # (bar.l <= 0 / bar.h >= 0), so a Gemini reply with
+                            # no stop_price used to add an UNPROTECTED lot.
+                            # Fall back to the same side-aware 2×ATR stop the
+                            # open path uses.
+                            if gem_stop:
+                                pyr_stop = float(gem_stop)
+                            elif pyramid_side == "short":
+                                pyr_stop = fill_price + atr14 * 2.0
+                            else:
+                                pyr_stop = fill_price - atr14 * 2.0
                             pyr_db_side = "BUY" if pyramid_side == "long" else "SELL"
                             try:
                                 pyr_order_id = self.db.insert_order({
                                     "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
-                                    "symbol": "MYM", "side": pyr_db_side, "qty": pqty,
+                                    "symbol": "MYM", "side": pyr_db_side, "qty": exec_qty,
                                     "order_type": "market", "limit_price": 0.0,
                                     "stop_price": pyr_stop,
                                     "status": "filled", "raw_response": "sim-pyramid at bar.c",
@@ -496,7 +561,7 @@ class LiveRunner:
                                     "order_id": pyr_order_id,
                                     "broker_fill_id": "sim-pyr-" + str(uuid.uuid4())[:8],
                                     "ts": str(bar.ts),
-                                    "qty": pqty,
+                                    "qty": exec_qty,
                                     "price": fill_price,
                                     "commission": 0.0,
                                 })
@@ -504,18 +569,15 @@ class LiveRunner:
                                 log.error("sim pyramid order/fill insert failed: %s", exc)
                             self._positions.append(_PositionState(
                                 side=pyramid_side,
-                                qty=pqty,
+                                qty=exec_qty,
                                 avg_price=fill_price,
                                 current_stop=pyr_stop,
                                 pyramid_adds_used=0,
                                 entry_ts=bar.ts,
                             ))
                             log.info("sim PYRAMID %s qty=%d entry=%.2f stop=%.2f positions=%d",
-                                     pyr_db_side, pqty, fill_price, pyr_stop, len(self._positions))
+                                     pyr_db_side, exec_qty, fill_price, pyr_stop, len(self._positions))
                             self._save_sim_state()
-                    else:
-                        log.info("add_pyramid skipped: existing side=%s would conflict",
-                                 self._positions[0].side)
 
                 # Only the OPEN path builds an Order/final_check here; close and
                 # add_pyramid are fully handled by their own blocks above. Without

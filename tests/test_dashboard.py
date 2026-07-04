@@ -27,7 +27,9 @@ client = TestClient(app)
 def test_index(mock_db_path):
     response = client.get("/")
     assert response.status_code == 200
-    assert "Current Position" in response.text
+    # Template was redesigned to stat-cards; assert on the stable position
+    # widget id instead of the old header text.
+    assert 'id="pos-side"' in response.text
 
 def test_equity(mock_db_path):
     response = client.get("/equity")

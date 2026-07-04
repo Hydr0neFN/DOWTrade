@@ -11,7 +11,7 @@ scheduler = BackgroundScheduler()
 def run_daily_journal():
     settings = Settings()
     db = Database(settings.db_path)
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     log.info(f"Running daily journal for {date_str}")
     try:
         generate_daily_journal(date_str, db)

@@ -44,15 +44,26 @@ async def test_on_candle_submits_order(runner):
     # Setup window to allow attr calculation
     for i in range(30):
         runner.window.append(Bar(1000 + i*900, 38000, 38010, 37990, 38005, 10))
-    
+
+    # Flat synthetic bars never produce a golden/death cross, and execution is
+    # now gated on the cross-filter (DeepSeek demoted to advisory) — force it
+    # open. The stop must sit within the $50 fixed risk budget (MYM $0.50/pt:
+    # 38005-37955 = 50 pts = $25/contract) or compute_size returns 0 and the
+    # open is skipped before final_check. SIM_FILLS is patched off to exercise
+    # the real broker submit path.
+    runner._cross = MagicMock()
+    runner._cross.allows.return_value = (True, "forced by test")
+    runner.gemini.evaluate.return_value = LLMCallResult(parsed={"action": "open_long", "stop_price": 37955.0}, raw_response="", latency_ms=0, input_tokens=0, output_tokens=0, cost_usd=0, error=None, used_fallback=False, model_used="")
+
     # Process one candle
     runner._on_candle("MYM", {"time": 30000000, "open": 38005, "high": 38010, "low": 38000, "close": 38005, "volume": 10})
-    
-    with patch("src.live.runner.final_check", return_value=MagicMock(approved=True, reason="ok")):
+
+    with patch("src.live.runner.SIM_FILLS", False), \
+         patch("src.live.runner.final_check", return_value=MagicMock(approved=True, reason="ok")):
         loop_task = asyncio.create_task(runner._process_loop())
         await asyncio.sleep(0.2)
         loop_task.cancel()
-    
+
     assert runner.broker.submit_bracket_order.called
     assert runner.db.insert_decision.called
     assert runner.db.insert_order.called
@@ -61,18 +72,25 @@ async def test_on_candle_submits_order(runner):
 async def test_on_candle_rejected_by_final_check(runner):
     for i in range(30):
         runner.window.append(Bar(1000 + i*900, 38000, 38010, 37990, 38005, 10))
-    
+
+    runner._cross = MagicMock()
+    runner._cross.allows.return_value = (True, "forced by test")
+    runner.gemini.evaluate.return_value = LLMCallResult(parsed={"action": "open_long", "stop_price": 37955.0}, raw_response="", latency_ms=0, input_tokens=0, output_tokens=0, cost_usd=0, error=None, used_fallback=False, model_used="")
+
     # Make final_check fail by patching it
-    with patch("src.live.runner.final_check", return_value=MagicMock(approved=False, reason="rejected")):
+    with patch("src.live.runner.SIM_FILLS", False), \
+         patch("src.live.runner.final_check", return_value=MagicMock(approved=False, reason="rejected")):
         runner._on_candle("MYM", {"time": 30000000, "open": 38005, "high": 38010, "low": 38000, "close": 38005, "volume": 10})
-        
+
         loop_task = asyncio.create_task(runner._process_loop())
         await asyncio.sleep(0.2)
         loop_task.cancel()
-    
+
     assert not runner.broker.submit_bracket_order.called
-    call_args = runner.db.insert_decision.call_args[1]
-    assert "final_check" in call_args["disagreement_flags"]
+    # The reject path re-inserts the decision row (bar_ts is UNIQUE + OR
+    # REPLACE) with the reason recorded in safety_notes.
+    last_decision = runner.db.insert_decision.call_args[0][0]
+    assert "final_check rejected" in last_decision["safety_notes"]
 
 @pytest.mark.asyncio
 async def test_cost_budget_exceeded(runner):

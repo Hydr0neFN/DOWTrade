@@ -206,6 +206,7 @@ class TestRenderPrompt:
             equity=10000.0,
             realized_pnl_today=0.0,
             atr14=150.0,
+            mark_price=40000.0,
         )
         assert "approved" in system
         assert "open_long" in user
