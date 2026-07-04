@@ -193,9 +193,10 @@ class LiveRunner:
     def _reset_daily_state(self):
         # Trading day = ET calendar date. Bars are RTH-only (^DJI), so an ET
         # date change can only be observed between sessions. The old version
-        # used the HOST's local clock plus an `hour >= 17` gate, which on a
-        # UTC host reset the daily-loss window at 13:00 ET — mid-session —
-        # effectively doubling MAX_DAILY_LOSS_USD for the day.
+        # used the HOST's local clock plus an `hour >= 17` gate, which reset
+        # the daily-loss window mid-session at a host-TZ-dependent time
+        # (11:00 ET on the original Europe/Amsterdam host) — effectively
+        # doubling MAX_DAILY_LOSS_USD for the day.
         day_str = datetime.now(ET).strftime("%Y-%m-%d")
         if self._last_day != day_str:
             self._budget_exceeded = False
