@@ -5,8 +5,8 @@ Dad's rule: ???????????- Golden cross (SMA20 > SMA50) = bullish
 - Death cross (SMA20 < SMA50) = bearish
 
 Filter mode: LLM proposes trade, cross must agree.
-- open_long requires BOTH 15m golden AND 1hr golden
-- open_short requires BOTH 15m death AND 1hr death
+- open_long requires 15m golden AND 1hr must NOT be death
+- open_short requires 15m death AND 1hr must NOT be golden
 - Otherwise: blocked
 
 Usage in runner.py:
@@ -136,14 +136,14 @@ class CrossFilter:
         s1h = cs["1hr"].state
 
         if action == "open_long":
-            if s15 == "golden" and s1h == "golden":
+            if s15 == "golden" and s1h != "death":
                 return True, f"cross_ok: 15m={s15} 1hr={s1h}"
-            return False, f"CROSS_BLOCKED: need golden/golden, got 15m={s15} 1hr={s1h}"
+            return False, f"CROSS_BLOCKED: need 15m=golden + 1hr!=death, got 15m={s15} 1hr={s1h}"
 
         if action == "open_short":
-            if s15 == "death" and s1h == "death":
+            if s15 == "death" and s1h != "golden":
                 return True, f"cross_ok: 15m={s15} 1hr={s1h}"
-            return False, f"CROSS_BLOCKED: need death/death, got 15m={s15} 1hr={s1h}"
+            return False, f"CROSS_BLOCKED: need 15m=death + 1hr!=golden, got 15m={s15} 1hr={s1h}"
 
         return True, "no_filter_needed"
 
