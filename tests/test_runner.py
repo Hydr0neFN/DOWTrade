@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 import asyncio
 from src.live.runner import LiveRunner, _PositionState
 from src.config import FIXED_RISK_PER_TRADE_USD, POINT_VALUE_USD
+from src.db.repo import init_db
 from src.data.bars import Bar
 from src.broker.models import AccountState, Position
 from src.llm.base import CostBudgetExceeded, LLMCallResult
@@ -33,8 +34,17 @@ def mock_broker():
     return broker
 
 @pytest.fixture
-def runner(mock_db, mock_broker):
+def runner(mock_db, mock_broker, tmp_path):
     r = LiveRunner()
+    # _save_sim_state / _load_sim_state open their OWN sqlite3 connection on
+    # settings.db_path (runner.py:123, :151) and ignore self.db entirely, so
+    # replacing self.db with a MagicMock does not isolate a test from the live
+    # ./data/bot.db. Any test that reaches the sim-fill path would otherwise
+    # overwrite the running bot's sim_state and sim_positions. Point the runner
+    # at a throwaway DB carrying the real schema before anything can persist.
+    test_db = tmp_path / "bot.db"
+    init_db(str(test_db))
+    r.settings.db_path = str(test_db)
     r.MIN_WARMUP_BARS = 20
     r.db = mock_db
     r.broker = mock_broker
