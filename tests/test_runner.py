@@ -1,10 +1,18 @@
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 import asyncio
-from src.live.runner import LiveRunner
+from src.live.runner import LiveRunner, _PositionState
+from src.config import FIXED_RISK_PER_TRADE_USD, POINT_VALUE_USD
 from src.data.bars import Bar
 from src.broker.models import AccountState, Position
 from src.llm.base import CostBudgetExceeded, LLMCallResult
+
+
+# Stop distance that makes compute_size return exactly 2 contracts at whatever
+# risk budget is configured: risk/contract = FIXED_RISK/2, so floor(2.0) = 2.
+# Derived rather than hard-coded so a future budget change does not turn these
+# into tests of a different code path.
+TWO_CONTRACT_STOP_DISTANCE = FIXED_RISK_PER_TRADE_USD / (2 * POINT_VALUE_USD)
 
 
 @pytest.fixture
@@ -91,6 +99,82 @@ async def test_on_candle_rejected_by_final_check(runner):
     # REPLACE) with the reason recorded in safety_notes.
     last_decision = runner.db.insert_decision.call_args[0][0]
     assert "final_check rejected" in last_decision["safety_notes"]
+
+def _arm_pyramid(runner, open_qty: int):
+    """Warm the window and stage an open, profitable `open_qty`-contract long.
+
+    The stop sits far below the test bar's low so the pre-decision stop check
+    does not close the position before the add is considered.
+    """
+    for i in range(30):
+        runner.window.append(Bar(1000 + i * 900, 38000, 38010, 37990, 38005, 10))
+
+    runner._cross = MagicMock()
+    runner._cross.allows.return_value = (True, "forced by test")
+
+    runner._positions = [_PositionState(
+        side="long",
+        qty=open_qty,
+        avg_price=37000.0,
+        current_stop=36000.0,
+        pyramid_adds_used=0,
+        entry_ts=1000,
+    )]
+
+    runner.gemini.evaluate.return_value = LLMCallResult(
+        parsed={"action": "add_pyramid",
+                "stop_price": 38005.0 - TWO_CONTRACT_STOP_DISTANCE},
+        raw_response="", latency_ms=0, input_tokens=0, output_tokens=0,
+        cost_usd=0, error=None, used_fallback=False, model_used="",
+    )
+
+    runner._on_candle("MYM", {"time": 30000000, "open": 38005, "high": 38010,
+                              "low": 38000, "close": 38005, "volume": 10})
+
+
+async def _run_one_bar(runner):
+    loop_task = asyncio.create_task(runner._process_loop())
+    await asyncio.sleep(0.2)
+    loop_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_pyramid_add_clamped_to_remaining_capacity(runner):
+    """Risk unit > remaining capacity must clamp the add, not drop it.
+
+    The backtest harness has always sized an add as min(risk_unit, remaining)
+    (harness.py:317-320); this path used to reject the whole add whenever the
+    full risk unit did not fit, which at a $250 budget meant 2 + 2 > 3 and no
+    add could ever fill. With 2 of 3 contracts already open and a 2-contract
+    risk unit, exactly 1 contract must fill.
+    """
+    _arm_pyramid(runner, open_qty=2)
+
+    with patch("src.live.runner.MAX_OPEN_CONTRACTS", 3), \
+         patch("src.live.runner.MAX_PYRAMID_ADDS", 2):
+        await _run_one_bar(runner)
+
+    assert len(runner._positions) == 2, "the add was dropped instead of clamped"
+    added = runner._positions[-1]
+    assert added.qty == 1, f"expected the add clamped to 1 contract, got {added.qty}"
+    assert added.side == "long"
+    assert sum(p.qty for p in runner._positions) == 3, "must land exactly on the cap"
+    # The fill row must carry the clamped size, not the unclamped risk unit.
+    assert runner.db.insert_fill.call_args[0][0]["qty"] == 1
+
+
+@pytest.mark.asyncio
+async def test_pyramid_add_refused_when_already_at_cap(runner):
+    """Clamping must not become "always allow one more": at the cap, refuse."""
+    _arm_pyramid(runner, open_qty=3)
+
+    with patch("src.live.runner.MAX_OPEN_CONTRACTS", 3), \
+         patch("src.live.runner.MAX_PYRAMID_ADDS", 2):
+        await _run_one_bar(runner)
+
+    assert len(runner._positions) == 1, "no add may fill once gross qty is at the cap"
+    assert sum(p.qty for p in runner._positions) == 3
+
 
 @pytest.mark.asyncio
 async def test_cost_budget_exceeded(runner):

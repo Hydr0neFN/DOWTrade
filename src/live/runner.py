@@ -523,14 +523,30 @@ class LiveRunner:
                     pyramid_side = self._positions[0].side
                     gross_qty = sum(p.qty for p in self._positions)
                     adds_used = len(self._positions) - 1
+                    remaining_qty = MAX_OPEN_CONTRACTS - gross_qty
                     if exec_qty < 1:
                         log.info("add_pyramid skipped: risk-unit size is 0 (stop too wide for $ budget)")
                     elif adds_used >= MAX_PYRAMID_ADDS:
                         log.info("add_pyramid skipped: MAX_PYRAMID_ADDS (%d) reached", MAX_PYRAMID_ADDS)
-                    elif gross_qty + exec_qty > MAX_OPEN_CONTRACTS:
-                        log.info("add_pyramid skipped: %d+%d would exceed MAX_OPEN_CONTRACTS (%d)",
-                                 gross_qty, exec_qty, MAX_OPEN_CONTRACTS)
+                    elif remaining_qty < 1:
+                        log.info("add_pyramid skipped: already at MAX_OPEN_CONTRACTS (%d)",
+                                 MAX_OPEN_CONTRACTS)
                     else:
+                        # CLAMP the add to remaining capacity instead of
+                        # rejecting it outright. The backtest harness has always
+                        # sized an add as min(risk_unit, remaining) —
+                        # harness.py:317-320 — so every sweep result describes
+                        # clamped behaviour; this path was the only divergent
+                        # component. It also mattered in practice: at a $250 risk
+                        # unit the initial entry is already 2 contracts, so
+                        # 2 + 2 > MAX_OPEN_CONTRACTS=3 rejected every add, and the
+                        # pyramid path became unreachable. MAX_OPEN_CONTRACTS
+                        # stays the binding rail either way — that is its job.
+                        pyr_qty = min(exec_qty, remaining_qty)
+                        if pyr_qty < exec_qty:
+                            log.info("add_pyramid clamped: risk unit %d -> %d contracts "
+                                     "(gross %d, cap %d)",
+                                     exec_qty, pyr_qty, gross_qty, MAX_OPEN_CONTRACTS)
                         cross_ok_pyr, cross_reason_pyr = self._cross.allows(
                             "open_long" if pyramid_side == "long" else "open_short"
                         )
@@ -553,7 +569,7 @@ class LiveRunner:
                             try:
                                 pyr_order_id = self.db.insert_order({
                                     "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
-                                    "symbol": "MYM", "side": pyr_db_side, "qty": exec_qty,
+                                    "symbol": "MYM", "side": pyr_db_side, "qty": pyr_qty,
                                     "order_type": "market", "limit_price": 0.0,
                                     "stop_price": pyr_stop,
                                     "status": "filled", "raw_response": "sim-pyramid at bar.c",
@@ -562,7 +578,7 @@ class LiveRunner:
                                     "order_id": pyr_order_id,
                                     "broker_fill_id": "sim-pyr-" + str(uuid.uuid4())[:8],
                                     "ts": str(bar.ts),
-                                    "qty": exec_qty,
+                                    "qty": pyr_qty,
                                     "price": fill_price,
                                     "commission": 0.0,
                                 })
@@ -570,14 +586,14 @@ class LiveRunner:
                                 log.error("sim pyramid order/fill insert failed: %s", exc)
                             self._positions.append(_PositionState(
                                 side=pyramid_side,
-                                qty=exec_qty,
+                                qty=pyr_qty,
                                 avg_price=fill_price,
                                 current_stop=pyr_stop,
                                 pyramid_adds_used=0,
                                 entry_ts=bar.ts,
                             ))
                             log.info("sim PYRAMID %s qty=%d entry=%.2f stop=%.2f positions=%d",
-                                     pyr_db_side, exec_qty, fill_price, pyr_stop, len(self._positions))
+                                     pyr_db_side, pyr_qty, fill_price, pyr_stop, len(self._positions))
                             self._save_sim_state()
 
                 # Only the OPEN path builds an Order/final_check here; close and
