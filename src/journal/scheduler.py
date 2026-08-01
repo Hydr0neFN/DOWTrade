@@ -1,5 +1,6 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import logging
 from src.journal.daily import generate_daily_journal
 from src.config import Settings
