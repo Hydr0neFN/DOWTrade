@@ -10,7 +10,15 @@ from __future__ import annotations
 import math
 import pytest
 
+from src.config import FIXED_RISK_PER_TRADE_USD
 from src.sizing.risk_unit import SizingResult, compute_size
+
+
+# The PDF p.10 worked examples are all quoted against a $50 risk unit. That was
+# also the deployed FIXED_RISK_PER_TRADE_USD until 2026-08-01, so these cases
+# used to pass on the default. Pin it explicitly: they test the sizing formula,
+# not whatever budget happens to be configured.
+SPEC_RISK_USD = 50.0
 
 
 # ======================================================================
@@ -23,7 +31,7 @@ class TestHappyPath:
     def test_mym_50pt_stop_2_contracts(self):
         # 50 pts * $0.50 = $25/contract, $50 risk → floor(50/25) = 2
         # risk_usd = 2 * $25 = $50
-        result = compute_size(42000, 41950)
+        result = compute_size(42000, 41950, fixed_risk_usd=SPEC_RISK_USD)
         assert result.contracts == 2
         assert result.skip_reason is None
         assert math.isclose(result.stop_distance_points, 50.0)
@@ -31,7 +39,7 @@ class TestHappyPath:
 
     def test_mym_20pt_stop_capped_at_3(self):
         # 20 pts * $0.50 = $10/contract, $50 risk → floor(50/10) = 5, capped to 3
-        result = compute_size(42000, 41980)
+        result = compute_size(42000, 41980, fixed_risk_usd=SPEC_RISK_USD)
         assert result.contracts == 3
         assert result.skip_reason is None
         assert math.isclose(result.stop_distance_points, 20.0)
@@ -39,14 +47,14 @@ class TestHappyPath:
 
     def test_short_side_same_math(self):
         # entry < stop (short): 50 pts * $0.50 = $25/contract → 2 contracts
-        result = compute_size(42000, 42050)
+        result = compute_size(42000, 42050, fixed_risk_usd=SPEC_RISK_USD)
         assert result.contracts == 2
         assert result.skip_reason is None
         assert math.isclose(result.stop_distance_points, 50.0)
 
     def test_exact_fit_1_contract(self):
         # 100 pts * $0.50 = $50/contract, $50 risk → floor(50/50) = 1 exactly
-        result = compute_size(42000, 41900)
+        result = compute_size(42000, 41900, fixed_risk_usd=SPEC_RISK_USD)
         assert result.contracts == 1
         assert result.skip_reason is None
         assert math.isclose(result.stop_distance_points, 100.0)
@@ -61,7 +69,7 @@ class TestSkipPath:
 
     def test_stop_too_wide_returns_skip(self):
         # 1000 pts * $0.50 = $500/contract, $50 risk → floor(50/500) = 0 → skip
-        result = compute_size(42000, 41000)
+        result = compute_size(42000, 41000, fixed_risk_usd=SPEC_RISK_USD)
         assert result.contracts == 0
         assert result.risk_usd == 0.0
         assert result.skip_reason == "stop too wide for risk unit"
@@ -144,15 +152,20 @@ class TestErrors:
     ],
 )
 def test_parametric_grid(entry, stop, expected_contracts):
-    result = compute_size(entry, stop)
+    result = compute_size(entry, stop, fixed_risk_usd=SPEC_RISK_USD)
     assert result.contracts == expected_contracts, (
         f"entry={entry}, stop={stop}: expected {expected_contracts} contracts, "
         f"got {result.contracts} (stop_dist={result.stop_distance_points})"
     )
 
 
-def test_risk_usd_never_exceeds_fixed_risk():
-    """risk_usd must be <= fixed_risk_usd whenever contracts > 0."""
+@pytest.mark.parametrize("fixed_risk_usd", [SPEC_RISK_USD, FIXED_RISK_PER_TRADE_USD])
+def test_risk_usd_never_exceeds_fixed_risk(fixed_risk_usd):
+    """risk_usd must be <= fixed_risk_usd whenever contracts > 0.
+
+    Checked against both the spec's $50 unit and whatever budget is currently
+    deployed, so a config change cannot quietly break the invariant.
+    """
     test_cases = [
         (42000, 41960),
         (42000, 41950),
@@ -161,10 +174,10 @@ def test_risk_usd_never_exceeds_fixed_risk():
         (42000, 41990),
     ]
     for entry, stop in test_cases:
-        result = compute_size(entry, stop)
+        result = compute_size(entry, stop, fixed_risk_usd=fixed_risk_usd)
         if result.contracts > 0:
-            assert result.risk_usd <= 50.0 + 1e-9, (
-                f"risk_usd {result.risk_usd} exceeds fixed_risk_usd 50.0 "
+            assert result.risk_usd <= fixed_risk_usd + 1e-9, (
+                f"risk_usd {result.risk_usd} exceeds fixed_risk_usd {fixed_risk_usd} "
                 f"for entry={entry}, stop={stop}"
             )
 
@@ -187,7 +200,7 @@ def test_custom_risk_and_point_value():
 def test_custom_max_contracts_respected():
     """max_contracts override caps correctly at a lower value."""
     # Without cap: floor($50 / (20pts * $0.50)) = 5; cap to 2
-    result = compute_size(42000, 41980, max_contracts=2)
+    result = compute_size(42000, 41980, fixed_risk_usd=SPEC_RISK_USD, max_contracts=2)
     assert result.contracts == 2
 
 

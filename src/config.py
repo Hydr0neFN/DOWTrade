@@ -26,10 +26,10 @@ BROKER_ENV: str = "demo"
 SYMBOL: str = "MYM"
 POINT_VALUE_USD: float = 0.50           # MYM: $0.50 per index point
 
-MAX_DAILY_LOSS_USD: float = 200.0
+MAX_DAILY_LOSS_USD: float = 600.0
 MAX_OPEN_CONTRACTS: int = 3
 MAX_PYRAMID_ADDS: int = 2
-FIXED_RISK_PER_TRADE_USD: float = 50.0
+FIXED_RISK_PER_TRADE_USD: float = 250.0
 
 MANDATORY_STOP_LOSS: bool = True
 NO_AVERAGING_DOWN: bool = True

@@ -14,9 +14,13 @@ import pytest
 
 from src.backtest.stubs import StubDeepSeek, StubGemini, StubHaiku, run_stub_pipeline
 from src.broker.models import AccountState, Position
+from src.config import MAX_DAILY_LOSS_USD
 from src.data.features import MarketSnapshot, SwingPoint
 
 ET = ZoneInfo("America/New_York")
+
+# Relative to the configured limit, not a literal — see tests/test_safety.py.
+LIMIT = MAX_DAILY_LOSS_USD
 
 
 # ---------------------------------------------------------------------------
@@ -433,14 +437,14 @@ class TestStubDeepSeek:
         assert "PYRAMID_VIOLATION" in result["violations"]
 
     def test_daily_loss_limit_at_threshold(self):
-        # realized=-201 -> total = -201 <= -200
-        state = make_state(realized_pnl_today=-201.0, unrealized_pnl=0.0)
+        # one dollar past the limit -> total <= -LIMIT
+        state = make_state(realized_pnl_today=-(LIMIT + 1.0), unrealized_pnl=0.0)
         result = self.ds.evaluate(self._gemini("open_long", 19800.0), 1, state, 50.0)
         assert result["approved"] is False
         assert "DAILY_LOSS_LIMIT" in result["violations"]
 
-    def test_daily_loss_limit_not_triggered_at_199(self):
-        state = make_state(realized_pnl_today=-199.0, unrealized_pnl=0.0)
+    def test_daily_loss_limit_not_triggered_just_under(self):
+        state = make_state(realized_pnl_today=-(LIMIT - 1.0), unrealized_pnl=0.0)
         result = self.ds.evaluate(self._gemini("open_long", 19800.0), 1, state, 50.0)
         assert "DAILY_LOSS_LIMIT" not in result["violations"]
 

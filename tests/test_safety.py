@@ -22,9 +22,15 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.broker.models import AccountState, Position, ProposedOrder
+from src.config import MAX_DAILY_LOSS_USD
 from src.safety.guards import GuardDecision, final_check
 
 ET = ZoneInfo("America/New_York")
+
+# Daily-loss cases are expressed relative to the configured limit rather than
+# to a literal, so raising/lowering MAX_DAILY_LOSS_USD does not silently turn
+# these into tests of nothing.
+LIMIT = MAX_DAILY_LOSS_USD
 
 
 # ---------------------------------------------------------------------------
@@ -381,16 +387,17 @@ class TestPyramidCheck:
 
 class TestDailyLossLimit:
     def test_at_limit_rejected(self):
-        # -200 == -MAX_DAILY_LOSS_USD (200)
-        state = make_state(realized_pnl_today=-200.0, unrealized_pnl=0.0)
+        # realized loss exactly == -MAX_DAILY_LOSS_USD
+        state = make_state(realized_pnl_today=-LIMIT, unrealized_pnl=0.0)
         assert_rejected(final_check(make_proposed(), state), "DAILY_LOSS_LIMIT")
 
     def test_over_limit_rejected(self):
-        state = make_state(realized_pnl_today=-150.0, unrealized_pnl=-60.0)
+        # realized + unrealized = -1.05 * LIMIT; neither leg alone breaches
+        state = make_state(realized_pnl_today=-0.75 * LIMIT, unrealized_pnl=-0.30 * LIMIT)
         assert_rejected(final_check(make_proposed(), state), "DAILY_LOSS_LIMIT")
 
     def test_just_under_limit_passes(self):
-        state = make_state(realized_pnl_today=-199.0, unrealized_pnl=0.0)
+        state = make_state(realized_pnl_today=-(LIMIT - 1.0), unrealized_pnl=0.0)
         assert_approved(final_check(make_proposed(), state))
 
     def test_positive_pnl_passes(self):
@@ -491,7 +498,7 @@ class TestTradingHours:
 
 class TestMultipleViolations:
     def test_symbol_and_daily_loss(self):
-        state = make_state(realized_pnl_today=-200.0)
+        state = make_state(realized_pnl_today=-LIMIT)
         proposed = make_proposed(symbol="ES")
         decision = final_check(proposed, state)
         assert not decision.approved
