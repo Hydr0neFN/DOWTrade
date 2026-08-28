@@ -1,3 +1,5 @@
+**English** · [繁體中文](README.zh-TW.md)
+
 # DOWTrade
 
 Paper-trading bot for Micro E-mini Dow futures (**MYM**). A three-LLM analysis
