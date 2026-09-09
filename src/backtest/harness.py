@@ -65,6 +65,11 @@ class _PositionState:
     current_stop: float = 0.0
     pyramid_adds_used: int = 0
     entry_ts: int = 0
+    # Stop at entry, before any trailing. Needed to express a closed trade as an
+    # R-multiple -- current_stop ratchets, so it cannot answer "how much was
+    # risked when this was opened".
+    initial_stop: float = 0.0
+    initial_risk_usd: float = 0.0
 
     def is_flat(self) -> bool:
         return self.side == "flat"

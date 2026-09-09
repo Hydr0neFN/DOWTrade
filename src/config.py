@@ -26,6 +26,21 @@ BROKER_ENV: str = "demo"
 SYMBOL: str = "MYM"
 POINT_VALUE_USD: float = 0.50           # MYM: $0.50 per index point
 
+# --- Execution cost model -------------------------------------------------
+# The sim booked every fill at bar.c with commission 0.0, which makes paper
+# results systematically optimistic and not comparable with anything external.
+# MYM ticks in whole index points; 1 point = POINT_VALUE_USD.
+COMMISSION_PER_CONTRACT_USD: float = 0.50   # per contract PER SIDE, all-in
+SLIPPAGE_TICKS: int = 1                     # adverse, applied to every fill
+TICK_SIZE_POINTS: float = 1.0               # MYM minimum price increment
+
+# Reporting denominator. The sim account's $1,000,000 is a broker fallback, not
+# the capital this strategy actually risks: FIXED_RISK_PER_TRADE_USD is $250 and
+# MAX_DAILY_LOSS_USD is $600, i.e. 0.025% of a million per trade. Percentages
+# against $1M are meaningless noise; report against the capital the risk budget
+# implies (1% risk per trade -> $25k).
+REPORTING_CAPITAL_USD: float = 25_000.0
+
 MAX_DAILY_LOSS_USD: float = 600.0
 MAX_OPEN_CONTRACTS: int = 3
 MAX_PYRAMID_ADDS: int = 2

@@ -25,7 +25,9 @@ from src.llm.gemini_execution import GeminiExecution
 from src.llm.deepseek_risk import DeepSeekRisk
 from src.backtest.harness import final_check, compute_size, _PositionState, _update_trailing_stop
 from src.broker.models import AccountState, Position
-from src.config import MAX_OPEN_CONTRACTS, MAX_PYRAMID_ADDS, WEEKEND_FLAT_DAY
+from src.config import (MAX_OPEN_CONTRACTS, MAX_PYRAMID_ADDS, WEEKEND_FLAT_DAY,
+                        POINT_VALUE_USD, COMMISSION_PER_CONTRACT_USD,
+                        SLIPPAGE_TICKS, TICK_SIZE_POINTS)
 from zoneinfo import ZoneInfo
 import json
 import uuid
@@ -86,6 +88,7 @@ class LiveRunner:
         # never equalled the prior row's end_equity whenever a position was
         # carried overnight.
         self._last_mark: float = 0.0
+        self._commission_today: float = 0.0
         self._cross = CrossFilter()
 
     def _on_candle(self, symbol: str, candle: dict):
@@ -148,6 +151,31 @@ class LiveRunner:
             current_stop REAL NOT NULL,
             entry_ts INTEGER NOT NULL
         )""")
+        # Added 2026-09-09 with the R-multiple work. ALTER is idempotent-by-catch
+        # so an existing DB upgrades in place.
+        for col, decl in (("initial_stop", "REAL DEFAULT 0"),
+                          ("initial_risk_usd", "REAL DEFAULT 0")):
+            try:
+                conn.execute(f"ALTER TABLE sim_positions ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass  # already present
+        conn.execute("""CREATE TABLE IF NOT EXISTS round_trips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exit_ts INTEGER NOT NULL,
+            entry_ts INTEGER NOT NULL,
+            side TEXT NOT NULL,
+            qty INTEGER NOT NULL,
+            entry_price REAL NOT NULL,
+            exit_price REAL NOT NULL,
+            initial_stop REAL NOT NULL,
+            initial_risk_usd REAL NOT NULL,
+            gross_pnl_usd REAL NOT NULL,
+            commission_usd REAL NOT NULL,
+            net_pnl_usd REAL NOT NULL,
+            r_multiple REAL,
+            hold_minutes REAL,
+            reason TEXT
+        )""")
         conn.commit()
         conn.close()
 
@@ -163,9 +191,11 @@ class LiveRunner:
              self._start_equity_today))
         conn.execute("DELETE FROM sim_positions")
         for pos in self._positions:
-            conn.execute("""INSERT INTO sim_positions (side, qty, avg_price, current_stop, entry_ts)
-                VALUES (?, ?, ?, ?, ?)""",
-                (pos.side, pos.qty, pos.avg_price, pos.current_stop, pos.entry_ts))
+            conn.execute("""INSERT INTO sim_positions
+                (side, qty, avg_price, current_stop, entry_ts, initial_stop, initial_risk_usd)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (pos.side, pos.qty, pos.avg_price, pos.current_stop, pos.entry_ts,
+                 pos.initial_stop, pos.initial_risk_usd))
         conn.commit()
         conn.close()
 
@@ -184,10 +214,13 @@ class LiveRunner:
         self._realized_pnl_today = row[7]
         self._trade_count = row[8]
         self._positions = []
-        for pr in conn.execute("SELECT side, qty, avg_price, current_stop, entry_ts FROM sim_positions").fetchall():
+        for pr in conn.execute(
+                "SELECT side, qty, avg_price, current_stop, entry_ts, "
+                "COALESCE(initial_stop,0), COALESCE(initial_risk_usd,0) FROM sim_positions").fetchall():
             self._positions.append(_PositionState(
                 side=pr[0], qty=pr[1], avg_price=pr[2],
-                current_stop=pr[3], pyramid_adds_used=0, entry_ts=pr[4]))
+                current_stop=pr[3], pyramid_adds_used=0, entry_ts=pr[4],
+                initial_stop=pr[5], initial_risk_usd=pr[6]))
         conn.close()
         log.info("Loaded sim state: cash=%.2f positions=%d realized=%.2f",
                  self._cash, len(self._positions), self._realized_pnl_today)
@@ -195,6 +228,50 @@ class LiveRunner:
             log.info("  pos: %s qty=%d entry=%.2f stop=%.2f", pos.side, pos.qty, pos.avg_price, pos.current_stop)
         return True
 
+
+    @staticmethod
+    def _fill_px(raw: float, is_buy: bool) -> float:
+        """Adverse slippage on every sim fill.
+
+        The sim used to fill at bar.c exactly, in both directions, with no
+        commission -- which makes paper P&L systematically optimistic and not
+        comparable with any externally reported result.
+        """
+        slip = SLIPPAGE_TICKS * TICK_SIZE_POINTS
+        return raw + slip if is_buy else raw - slip
+
+    @staticmethod
+    def _commission(qty: int) -> float:
+        return COMMISSION_PER_CONTRACT_USD * qty
+
+    def _record_round_trip(self, pos, exit_ts, exit_price: float,
+                           gross_pnl: float, commission: float, reason: str) -> None:
+        """One row per closed lot, in R-multiples.
+
+        Win rate, average win/loss and expectancy are the numbers any comparable
+        strategy is judged on, and none of them could be answered without
+        replaying `fills` by hand.
+        """
+        import sqlite3 as _sq
+        net = gross_pnl - commission
+        risk = pos.initial_risk_usd or 0.0
+        try:
+            conn = _sq.connect(self.settings.db_path)
+            conn.execute(
+                """INSERT INTO round_trips
+                   (exit_ts, entry_ts, side, qty, entry_price, exit_price,
+                    initial_stop, initial_risk_usd, gross_pnl_usd, commission_usd,
+                    net_pnl_usd, r_multiple, hold_minutes, reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (int(exit_ts), int(pos.entry_ts), pos.side, pos.qty,
+                 pos.avg_price, exit_price, pos.initial_stop, risk,
+                 gross_pnl, commission, net,
+                 (net / risk) if risk > 0 else None,
+                 (int(exit_ts) - int(pos.entry_ts)) / 60.0 if pos.entry_ts else None,
+                 reason))
+            conn.commit(); conn.close()
+        except Exception as exc:
+            log.error("round_trip insert failed: %s", exc)
 
     def _open_unrealized(self) -> float:
         """Mark-to-market of the open lots at the last seen price."""
@@ -223,7 +300,7 @@ class LiveRunner:
                 "end_equity": self._cash + unreal,
                 "realized_pnl": self._realized_pnl_today,
                 "unrealized_pnl": unreal,
-                "commission": 0.0,
+                "commission": self._commission_today,
                 "trade_count": self._trade_count,
             })
         except Exception as exc:
@@ -241,6 +318,7 @@ class LiveRunner:
             self._budget_exceeded = False
             self._last_day = day_str
             self._realized_pnl_today = 0.0
+            self._commission_today = 0.0
             self._trade_count = 0
             # Carry the open position's mark into start-of-day equity, so
             # start_equity == the previous row's end_equity and NAV deltas
@@ -252,9 +330,10 @@ class LiveRunner:
         """Market-close every sim position at bar.c (Gemini close / weekend flat)."""
         closed_ids: set[int] = set()
         for pos in list(self._positions):
-            fill_price = bar.c
-            pnl = pos.unrealized_pnl(fill_price)
             db_close_side = "BUY" if pos.side == "short" else "SELL"
+            fill_price = self._fill_px(bar.c, is_buy=(db_close_side == "BUY"))
+            pnl = pos.unrealized_pnl(fill_price)
+            comm = self._commission(pos.qty)
             try:
                 close_order_id = self.db.insert_order({
                     "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
@@ -269,7 +348,7 @@ class LiveRunner:
                     "ts": str(bar.ts),
                     "qty": pos.qty,
                     "price": fill_price,
-                    "commission": 0.0,
+                    "commission": comm,
                 })
             except Exception as exc:
                 # Fail CLOSED. Mutating cash before this insert is how the sim
@@ -293,17 +372,19 @@ class LiveRunner:
                         "order_id": close_order_id,
                         "broker_fill_id": "sim-close-" + str(uuid.uuid4())[:8],
                         "ts": str(bar.ts), "qty": pos.qty,
-                        "price": fill_price, "commission": 0.0,
+                        "price": fill_price, "commission": comm,
                     })
                 except Exception as exc2:
                     log.error("sim close retry failed, KEEPING POSITION OPEN: %s", exc2)
                     continue
-            self._cash += pnl
-            self._realized_pnl_today += pnl
+            self._cash += pnl - comm
+            self._realized_pnl_today += pnl - comm
+            self._commission_today += comm
             self._trade_count += 1
             closed_ids.add(id(pos))
-            log.info("sim CLOSE (%s) %s qty=%d fill=%.2f pnl=%.2f cash=%.2f",
-                     reason, pos.side, pos.qty, fill_price, pnl, self._cash)
+            self._record_round_trip(pos, bar.ts, fill_price, pnl, comm, reason)
+            log.info("sim CLOSE (%s) %s qty=%d fill=%.2f pnl=%.2f comm=%.2f cash=%.2f",
+                     reason, pos.side, pos.qty, fill_price, pnl, comm, self._cash)
         self._positions = [p for p in self._positions if id(p) not in closed_ids]
         self._save_sim_state()
 
@@ -355,10 +436,14 @@ class LiveRunner:
                             # stop, fill at the open (the realistic price), not the
                             # stop, so paper P&L isn't optimistically biased.
                             if pos.side == "long":
-                                fill_price = min(pos.current_stop, bar.o)
+                                raw_px = min(pos.current_stop, bar.o)
                             else:
-                                fill_price = max(pos.current_stop, bar.o)
+                                raw_px = max(pos.current_stop, bar.o)
+                            stop_db_side_early = "BUY" if pos.side == "short" else "SELL"
+                            fill_price = self._fill_px(
+                                raw_px, is_buy=(stop_db_side_early == "BUY"))
                             pnl = pos.unrealized_pnl(fill_price)
+                            comm = self._commission(pos.qty)
                             # fills.order_id is NOT NULL REFERENCES orders(id) with
                             # foreign_keys=ON, so order_id=0 raised IntegrityError and
                             # the stop exit was silently dropped from the DB (dashboard
@@ -379,17 +464,20 @@ class LiveRunner:
                                     "ts": str(bar.ts),
                                     "qty": pos.qty,
                                     "price": fill_price,
-                                    "commission": 0.0,
+                                    "commission": comm,
                                 })
                             except Exception as exc:
                                 # Fail CLOSED -- see _sim_close_all. Cash must
                                 # never move without its fill row.
                                 log.error("sim stop-fill insert failed, KEEPING POSITION OPEN: %s", exc)
                                 continue
-                            self._cash += pnl
-                            self._realized_pnl_today += pnl
-                            log.info("sim STOP HIT %s qty=%d fill=%.2f pnl=%.2f cash=%.2f",
-                                     pos.side, pos.qty, fill_price, pnl, self._cash)
+                            self._cash += pnl - comm
+                            self._realized_pnl_today += pnl - comm
+                            self._commission_today += comm
+                            self._record_round_trip(pos, bar.ts, fill_price, pnl,
+                                                    comm, "stop")
+                            log.info("sim STOP HIT %s qty=%d fill=%.2f pnl=%.2f comm=%.2f cash=%.2f",
+                                     pos.side, pos.qty, fill_price, pnl, comm, self._cash)
                             stopped.append(i)
                             self._trade_count += 1
                     if stopped:
@@ -618,7 +706,10 @@ class LiveRunner:
                         if not cross_ok_pyr:
                             log.info("add_pyramid blocked by cross filter: %s", cross_reason_pyr)
                         else:
-                            fill_price = bar.c
+                            pyr_db_side_early = "BUY" if pyramid_side == "long" else "SELL"
+                            fill_price = self._fill_px(
+                                bar.c, is_buy=(pyr_db_side_early == "BUY"))
+                            pyr_comm = self._commission(pyr_qty)
                             # MANDATORY_STOP_LOSS: a 0.0 stop is never hit
                             # (bar.l <= 0 / bar.h >= 0), so a Gemini reply with
                             # no stop_price used to add an UNPROTECTED lot.
@@ -645,10 +736,17 @@ class LiveRunner:
                                     "ts": str(bar.ts),
                                     "qty": pyr_qty,
                                     "price": fill_price,
-                                    "commission": 0.0,
+                                    "commission": pyr_comm,
                                 })
                             except Exception as exc:
-                                log.error("sim pyramid order/fill insert failed: %s", exc)
+                                # Fail CLOSED -- same invariant as every other
+                                # fill site: no lot without its audit row.
+                                log.error("sim pyramid order/fill insert failed, "
+                                          "NOT ADDING LOT: %s", exc)
+                                continue
+                            self._cash -= pyr_comm
+                            self._realized_pnl_today -= pyr_comm
+                            self._commission_today += pyr_comm
                             self._positions.append(_PositionState(
                                 side=pyramid_side,
                                 qty=pyr_qty,
@@ -656,9 +754,13 @@ class LiveRunner:
                                 current_stop=pyr_stop,
                                 pyramid_adds_used=0,
                                 entry_ts=bar.ts,
+                                initial_stop=pyr_stop,
+                                initial_risk_usd=abs(fill_price - pyr_stop)
+                                                 * pyr_qty * POINT_VALUE_USD,
                             ))
-                            log.info("sim PYRAMID %s qty=%d entry=%.2f stop=%.2f positions=%d",
-                                     pyr_db_side, pyr_qty, fill_price, pyr_stop, len(self._positions))
+                            log.info("sim PYRAMID %s qty=%d entry=%.2f stop=%.2f comm=%.2f positions=%d",
+                                     pyr_db_side, pyr_qty, fill_price, pyr_stop, pyr_comm,
+                                     len(self._positions))
                             self._save_sim_state()
 
                 # Only the OPEN path builds an Order/final_check here; close and
@@ -691,7 +793,10 @@ class LiveRunner:
                                 log.info("sim fill skipped: max positions reached (%d/%d)",
                                          len(self._positions), MAX_POSITIONS)
                             else:
-                                fill_price = bar.c
+                                fill_price = self._fill_px(
+                                    bar.c, is_buy=(db_side == "BUY"))
+                                entry_comm = self._commission(order.qty)
+                                entry_stop = float(order.stop_price or 0.0)
                                 try:
                                     order_id = self.db.insert_order({
                                         "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
@@ -706,21 +811,32 @@ class LiveRunner:
                                         "ts": str(bar.ts),
                                         "qty": order.qty,
                                         "price": fill_price,
-                                        "commission": 0.0,
+                                        "commission": entry_comm,
                                     })
                                 except Exception as exc:
-                                    log.error("sim order/fill insert failed: %s", exc)
+                                    # Fail CLOSED, same invariant as the exit
+                                    # paths: never hold a lot the audit trail
+                                    # has no fill for.
+                                    log.error("sim order/fill insert failed, "
+                                              "NOT OPENING POSITION: %s", exc)
+                                    continue
+                                self._cash -= entry_comm
+                                self._realized_pnl_today -= entry_comm
+                                self._commission_today += entry_comm
                                 self._positions.append(_PositionState(
                                     side=order.side,
                                     qty=order.qty,
                                     avg_price=fill_price,
-                                    current_stop=float(order.stop_price or 0.0),
+                                    current_stop=entry_stop,
                                     pyramid_adds_used=0,
                                     entry_ts=bar.ts,
+                                    initial_stop=entry_stop,
+                                    initial_risk_usd=abs(fill_price - entry_stop)
+                                                     * order.qty * POINT_VALUE_USD,
                                 ))
-                                log.info("sim FILL %s %s qty=%d entry=%.2f stop=%.2f",
+                                log.info("sim FILL %s %s qty=%d entry=%.2f stop=%.2f comm=%.2f",
                                          db_side, order.symbol, order.qty, fill_price,
-                                         float(order.stop_price or 0.0))
+                                         entry_stop, entry_comm)
                                 self._save_sim_state()
                         else:
                             try:
