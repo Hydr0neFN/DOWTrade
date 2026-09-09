@@ -80,6 +80,12 @@ class LiveRunner:
         self._start_equity_today: float = 0.0
         self._realized_pnl_today: float = 0.0
         self._trade_count: int = 0
+        # Last observed mark. _reset_daily_state fires before the new bar is
+        # built, so start-of-day equity has to be marked against the previous
+        # bar's close; without it start_equity was cash-only and therefore
+        # never equalled the prior row's end_equity whenever a position was
+        # carried overnight.
+        self._last_mark: float = 0.0
         self._cross = CrossFilter()
 
     def _on_candle(self, symbol: str, candle: dict):
@@ -190,6 +196,39 @@ class LiveRunner:
         return True
 
 
+    def _open_unrealized(self) -> float:
+        """Mark-to-market of the open lots at the last seen price."""
+        if not self._positions or self._last_mark <= 0:
+            return 0.0
+        return sum(p.unrealized_pnl(self._last_mark) for p in self._positions)
+
+    def _upsert_equity_row(self) -> None:
+        """Write today's equity row from FINAL post-bar state.
+
+        This used to run near the top of the bar loop, before the bar's own
+        exits were booked. An exit on the last bar of a session therefore
+        never reached any row's realized_pnl -- it sat in that row's
+        unrealized_pnl and was zeroed by the next day's reset. That is how
+        the 2026-08-05 round trip (+$1,916.98) went missing, and 7 other days
+        with it. INSERT OR REPLACE is keyed on date, so calling this once per
+        bar keeps the row equal to the latest state of the day.
+        """
+        if not SIM_FILLS:
+            return
+        try:
+            unreal = self._open_unrealized()
+            self.db.insert_equity({
+                "date": datetime.now(ET).strftime("%Y-%m-%d"),
+                "start_equity": self._start_equity_today,
+                "end_equity": self._cash + unreal,
+                "realized_pnl": self._realized_pnl_today,
+                "unrealized_pnl": unreal,
+                "commission": 0.0,
+                "trade_count": self._trade_count,
+            })
+        except Exception as exc:
+            log.error("equity row upsert failed: %s", exc)
+
     def _reset_daily_state(self):
         # Trading day = ET calendar date. Bars are RTH-only (^DJI), so an ET
         # date change can only be observed between sessions. The old version
@@ -203,17 +242,18 @@ class LiveRunner:
             self._last_day = day_str
             self._realized_pnl_today = 0.0
             self._trade_count = 0
-            self._start_equity_today = self._cash
+            # Carry the open position's mark into start-of-day equity, so
+            # start_equity == the previous row's end_equity and NAV deltas
+            # chain correctly across days.
+            self._start_equity_today = self._cash + self._open_unrealized()
             log.info("Reset daily state for %s (start_equity=%.2f)", day_str, self._start_equity_today)
 
     def _sim_close_all(self, bar: DataBar, reason: str) -> None:
         """Market-close every sim position at bar.c (Gemini close / weekend flat)."""
+        closed_ids: set[int] = set()
         for pos in list(self._positions):
             fill_price = bar.c
             pnl = pos.unrealized_pnl(fill_price)
-            self._cash += pnl
-            self._realized_pnl_today += pnl
-            self._trade_count += 1
             db_close_side = "BUY" if pos.side == "short" else "SELL"
             try:
                 close_order_id = self.db.insert_order({
@@ -232,10 +272,39 @@ class LiveRunner:
                     "commission": 0.0,
                 })
             except Exception as exc:
-                log.error("sim close order/fill insert failed: %s", exc)
+                # Fail CLOSED. Mutating cash before this insert is how the sim
+                # ledger drifted +$350.83 away from its own fills: the cash
+                # moved, the audit row did not, and nothing alerted. Leaving
+                # the lot open keeps cash and fills reconcilable.
+                #
+                # Retry once first: a weekend-flat that fails has no later bar
+                # to retry on, so it would carry the weekend gap -- the exact
+                # hazard the FLAT_BEFORE_WEEKEND rail exists to prevent.
+                log.error("sim close order/fill insert failed (%s), retrying once", exc)
+                try:
+                    close_order_id = self.db.insert_order({
+                        "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
+                        "symbol": "MYM", "side": db_close_side, "qty": pos.qty,
+                        "order_type": "market", "limit_price": 0.0,
+                        "stop_price": 0.0,
+                        "status": "filled", "raw_response": f"sim-close at bar.c ({reason}, retry)",
+                    })
+                    self.db.insert_fill({
+                        "order_id": close_order_id,
+                        "broker_fill_id": "sim-close-" + str(uuid.uuid4())[:8],
+                        "ts": str(bar.ts), "qty": pos.qty,
+                        "price": fill_price, "commission": 0.0,
+                    })
+                except Exception as exc2:
+                    log.error("sim close retry failed, KEEPING POSITION OPEN: %s", exc2)
+                    continue
+            self._cash += pnl
+            self._realized_pnl_today += pnl
+            self._trade_count += 1
+            closed_ids.add(id(pos))
             log.info("sim CLOSE (%s) %s qty=%d fill=%.2f pnl=%.2f cash=%.2f",
                      reason, pos.side, pos.qty, fill_price, pnl, self._cash)
-        self._positions = []
+        self._positions = [p for p in self._positions if id(p) not in closed_ids]
         self._save_sim_state()
 
     async def _process_loop(self):
@@ -265,6 +334,8 @@ class LiveRunner:
                 
                 if len(self.window) > 0 and bar.ts <= self.window.as_list()[-1].ts:
                     continue
+
+                self._last_mark = bar.c
                     
                 self.window.append(bar)
                 self._cross.update(bar)
@@ -288,8 +359,6 @@ class LiveRunner:
                             else:
                                 fill_price = max(pos.current_stop, bar.o)
                             pnl = pos.unrealized_pnl(fill_price)
-                            self._cash += pnl
-                            self._realized_pnl_today += pnl
                             # fills.order_id is NOT NULL REFERENCES orders(id) with
                             # foreign_keys=ON, so order_id=0 raised IntegrityError and
                             # the stop exit was silently dropped from the DB (dashboard
@@ -313,7 +382,12 @@ class LiveRunner:
                                     "commission": 0.0,
                                 })
                             except Exception as exc:
-                                log.warning("sim stop-fill insert failed: %s", exc)
+                                # Fail CLOSED -- see _sim_close_all. Cash must
+                                # never move without its fill row.
+                                log.error("sim stop-fill insert failed, KEEPING POSITION OPEN: %s", exc)
+                                continue
+                            self._cash += pnl
+                            self._realized_pnl_today += pnl
                             log.info("sim STOP HIT %s qty=%d fill=%.2f pnl=%.2f cash=%.2f",
                                      pos.side, pos.qty, fill_price, pnl, self._cash)
                             stopped.append(i)
@@ -369,15 +443,6 @@ class LiveRunner:
                         position=agg_pos,
                         now_et=datetime.fromtimestamp(bar.ts, tz=ET),
                     )
-                    self.db.insert_equity({
-                        "date": datetime.now(ET).strftime("%Y-%m-%d"),
-                        "start_equity": self._start_equity_today,
-                        "end_equity": state.equity,
-                        "realized_pnl": self._realized_pnl_today,
-                        "unrealized_pnl": sim_unreal,
-                        "commission": 0.0,
-                        "trade_count": self._trade_count,
-                    })
                 else:
                     state = self.broker.get_account_state()
                     self.db.insert_equity({
@@ -696,6 +761,10 @@ class LiveRunner:
                 self._budget_exceeded = True
             except Exception as e:
                 log.error(f"Error in process loop: {e}", exc_info=True)
+            finally:
+                # AFTER the bar's exits and entries, and on every `continue`
+                # path through the body. This ordering is the whole fix.
+                self._upsert_equity_row()
 
     async def start(self):
         log.info("LiveRunner starting...")
@@ -715,6 +784,11 @@ class LiveRunner:
                 self._start_equity_today = self._cash
             self._save_sim_state()
         await self._hydrate_window()
+        if len(self.window) > 0:
+            # Without this the first _reset_daily_state after a restart runs
+            # with _last_mark == 0 and silently falls back to cash-only start
+            # equity for a position carried overnight.
+            self._last_mark = self.window.as_list()[-1].c
         
         if self.USE_YFINANCE:
             self.streamer = YFinancePoller(YF_DATA_SYMBOL, self._on_candle)

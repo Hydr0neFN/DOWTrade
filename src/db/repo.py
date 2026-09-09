@@ -202,13 +202,24 @@ class Database:
     # ------------------------------------------------------------------
 
     def insert_equity(self, equity: Mapping[str, Any]) -> int:
+        # UPSERT, not INSERT OR REPLACE: sqlite implements the latter as
+        # DELETE+INSERT, which burns a new AUTOINCREMENT id on every one of the
+        # ~26 writes per session (the early rows are already at id 20 and 110)
+        # and would take any future child row with it. Same effect, in place.
         sql = """
-            INSERT OR REPLACE INTO equity
+            INSERT INTO equity
                 (date, start_equity, end_equity, realized_pnl,
                  unrealized_pnl, commission, trade_count)
             VALUES
                 (:date, :start_equity, :end_equity, :realized_pnl,
                  :unrealized_pnl, :commission, :trade_count)
+            ON CONFLICT(date) DO UPDATE SET
+                start_equity   = excluded.start_equity,
+                end_equity     = excluded.end_equity,
+                realized_pnl   = excluded.realized_pnl,
+                unrealized_pnl = excluded.unrealized_pnl,
+                commission     = excluded.commission,
+                trade_count    = excluded.trade_count
         """
         cur = self._execute(sql, equity)
         return cur.lastrowid  # type: ignore[return-value]
