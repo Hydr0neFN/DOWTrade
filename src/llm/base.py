@@ -19,7 +19,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from src.config import MAX_LLM_SPEND_USD
+from src.config import (
+    MAX_DAILY_LOSS_USD,
+    MAX_LLM_SPEND_USD,
+    MAX_OPEN_CONTRACTS,
+    MAX_PYRAMID_ADDS,
+    STOP_ATR_MAX_MULT,
+    STOP_ATR_MIN_MULT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -97,10 +104,41 @@ def parse_json_strict(raw: str) -> Optional[dict]:
         return None
 
 
+def _trim(value: float | int) -> str:
+    """Render a rail the way a prompt should read it: 600.0 -> "600"."""
+    return str(int(value)) if float(value) == int(value) else str(value)
+
+
+def prompt_rails() -> dict:
+    """The hard safety rails, named for use as prompt placeholders.
+
+    A prompt that states a threshold in prose is a second copy of that
+    threshold, and copies drift: risk_audit.txt told the auditor the daily-loss
+    limit was $200 for long enough that both READMEs learned it from there,
+    while src/config.py had said $600 the whole time. The auditor was flagging a
+    limit the bot does not enforce. Prompts now interpolate these instead of
+    restating them, so src/config.py stays the only place a rail is written down.
+
+    Merged underneath the caller's kwargs, so a caller that deliberately wants a
+    different number (a backtest sweep, a regression fixture) can still pass one.
+    """
+    return {
+        "max_daily_loss_usd": _trim(MAX_DAILY_LOSS_USD),
+        "max_open_contracts": _trim(MAX_OPEN_CONTRACTS),
+        "max_pyramid_adds": _trim(MAX_PYRAMID_ADDS),
+        "stop_atr_min_mult": _trim(STOP_ATR_MIN_MULT),
+        "stop_atr_max_mult": _trim(STOP_ATR_MAX_MULT),
+    }
+
+
 def render_prompt(template_path: Path, **kwargs: Any) -> Tuple[str, str]:
     """
     Load a prompt template file and split on ---SYSTEM--- / ---USER--- markers.
     Returns (system_text, user_text) with kwargs substituted.
+
+    The safety rails from prompt_rails() are available to every template without
+    the caller passing them, which keeps existing call sites -- and their tests --
+    working unchanged when a prompt starts quoting a rail.
     """
     content = template_path.read_text(encoding="utf-8")
     parts = re.split(r'---SYSTEM---\s*', content, maxsplit=1)
@@ -111,8 +149,9 @@ def render_prompt(template_path: Path, **kwargs: Any) -> Tuple[str, str]:
     if len(halves) != 2:
         raise ValueError(f"Template {template_path} missing ---USER--- marker")
     system_tmpl, user_tmpl = halves
-    system = system_tmpl.strip().format(**kwargs)
-    user = user_tmpl.strip().format(**kwargs)
+    ctx = {**prompt_rails(), **kwargs}
+    system = system_tmpl.strip().format(**ctx)
+    user = user_tmpl.strip().format(**ctx)
     return system, user
 
 
