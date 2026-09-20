@@ -409,6 +409,9 @@ RISK_VIOLATION = {
 }
 
 
+from src.llm.deepseek_risk import CF_MODELS, HF_MODEL
+
+
 class TestDeepSeekRisk:
     def _make_client(self, tracker=None):
         from src.llm.deepseek_risk import DeepSeekRisk
@@ -457,21 +460,92 @@ class TestDeepSeekRisk:
             mock_cc.assert_not_called()
         assert result.error == "budget_exceeded"
 
-    def test_fallback_chain_first_two_fail_third_succeeds(self):
-        client = self._make_client()
-        call_count = [0]
+    def test_fallback_chain_crosses_providers(self):
+        """HF primary fails, both Cloudflare models are tried, the second answers.
 
-        def side_effect(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] <= 2:
+        The chain used to be four HuggingFace models on one client, so this test
+        could count calls on a single mock. It is now HF -> Cloudflare, and the
+        point of that split is precisely that the second provider is reachable
+        when the first one is not -- so the test has to span both clients or it
+        is not testing the property that matters.
+        """
+        client = self._make_client()
+        client._cf_client = MagicMock()
+
+        hf_calls, cf_calls = [], []
+
+        def hf_side_effect(*args, **kwargs):
+            hf_calls.append(kwargs.get("model"))
+            raise Exception("402 Payment Required")
+
+        def cf_side_effect(*args, **kwargs):
+            cf_calls.append(kwargs.get("model"))
+            if len(cf_calls) == 1:
                 raise Exception("503 service unavailable")
             return _make_hf_response(RISK_GOOD)
 
-        with patch.object(client._client, "chat_completion", side_effect=side_effect):
+        with patch.object(client._client, "chat_completion", side_effect=hf_side_effect):
+            client._cf_client.chat_completion = MagicMock(side_effect=cf_side_effect)
             result = client.evaluate_raw("system", "user", bar_ts=12345)
 
-        assert call_count[0] == 3
+        assert hf_calls == [HF_MODEL]
+        assert cf_calls == CF_MODELS
         assert result.parsed["approved"] is True
+        assert client._last_model == CF_MODELS[1]
+
+    def test_cloudflare_leg_skipped_without_credentials(self):
+        """No CF credentials must degrade to HF-only, not raise."""
+        client = self._make_client()
+        assert client._cf_client is None, "test env must not carry CF credentials"
+
+        with patch.object(client._client, "chat_completion",
+                          side_effect=Exception("402 Payment Required")):
+            result = client.evaluate_raw("system", "user", bar_ts=12345)
+
+        assert result.used_fallback is True
+        assert "llm_unavailable" in result.parsed["violations"]
+
+    def test_empty_content_falls_through_to_next_model(self):
+        """Reasoning-only models answer in `reasoning` and leave `content` empty.
+
+        Half the free Cloudflare catalogue behaves this way. An empty string is
+        not a parse failure to be reported, it is this model being unusable --
+        so it must fall through to the next one rather than consume the attempt.
+        """
+        client = self._make_client()
+        client._cf_client = MagicMock()
+
+        empty = MagicMock()
+        empty.choices = [MagicMock(message=MagicMock(content=""))]
+        empty.usage = MagicMock(prompt_tokens=10, completion_tokens=0)
+
+        cf_models = []
+
+        def cf_side_effect(*args, **kwargs):
+            cf_models.append(kwargs.get("model"))
+            return _make_hf_response(RISK_GOOD) if len(cf_models) == 2 else empty
+
+        with patch.object(client._client, "chat_completion", return_value=empty):
+            client._cf_client.chat_completion = MagicMock(side_effect=cf_side_effect)
+            result = client.evaluate_raw("system", "user", bar_ts=12345)
+
+        assert cf_models == CF_MODELS
+        assert result.parsed["approved"] is True
+        assert client._last_model == CF_MODELS[1]
+
+    def test_cloudflare_calls_are_free(self):
+        """A free-tier call must not be billed the HuggingFace placeholder.
+
+        _actual_cost_usd() returns a flat $0.001 stand-in, which is fine for the
+        metered HF endpoint but walks the shared CostTracker toward
+        MAX_LLM_SPEND_USD on Cloudflare spend that never happens -- and hitting
+        that cap stops the risk audit outright.
+        """
+        client = self._make_client()
+        client._last_model = CF_MODELS[0]
+        assert client._actual_cost_usd(1000, 1000) == 0.0
+        client._last_model = HF_MODEL
+        assert client._actual_cost_usd(1000, 1000) > 0.0
 
     def test_db_persistence(self):
         client = self._make_client()
