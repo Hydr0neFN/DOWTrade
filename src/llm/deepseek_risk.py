@@ -115,7 +115,12 @@ class DeepSeekRisk(LLMClient):
         raise RuntimeError(f"All risk-audit models failed: {last_exc}")
 
     def _actual_cost_usd(self, in_tok: int, out_tok: int) -> float:
-        # HF Inference API is on user's plan; $0.001 placeholder per call
+        # Cloudflare Workers AI runs inside the free daily Neuron allowance, so
+        # charging the HF placeholder for it would walk the shared CostTracker
+        # into MAX_LLM_SPEND_USD and halt risk auditing over spend that never
+        # happened. HF Inference API is on the user's plan; $0.001 placeholder.
+        if self._last_model.startswith("@cf/"):
+            return 0.0
         return 0.001
 
     def _estimated_cost_usd(self, prompt_chars: int) -> float:
