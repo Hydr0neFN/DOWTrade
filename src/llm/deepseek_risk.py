@@ -7,6 +7,7 @@ Replaces StubDeepSeek from Phase 2.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -19,12 +20,23 @@ log = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "risk_audit.txt"
 
-HF_MODELS = [
-    "deepseek-ai/DeepSeek-V3.2-Exp",
-    "Qwen/Qwen3-8B-Instruct",
-    "meta-llama/Llama-3.3-70B-Instruct",
-    "mistralai/Mixtral-8x7B-Instruct-v0.1",
+# Provider chain: HuggingFace first (DeepSeek V4.1-Flash), then Cloudflare
+# Workers AI as a free fallback. The HF free tier returns 402 for *every*
+# model once the monthly credit allowance is spent, so the old all-HF chain
+# died as a unit -- it had been failing since 2026-09-15 unnoticed.
+HF_MODEL = os.environ.get("HF_RISK_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
+
+# Workers AI free plan, OpenAI-compatible endpoint. Both picked by measured
+# accuracy on this exact risk_audit prompt: mistral-small has the best
+# violation recall, llama-4-scout is the most deterministic. Models that put
+# their answer in `reasoning` and leave `content` empty (gpt-oss, glm-4.7-flash,
+# nemotron-3, gemma-4, qwen3-30b) are unusable here -- json.loads() gets "".
+CF_MODELS = [
+    "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    "@cf/meta/llama-4-scout-17b-16e-instruct",
 ]
+CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+CF_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
 
 
 class DeepSeekRisk(LLMClient):
@@ -53,24 +65,46 @@ class DeepSeekRisk(LLMClient):
     ) -> None:
         super().__init__(tracker=tracker, db=db, prompt_path=prompt_path or _PROMPT_PATH)
         self._client = HFClient(token=api_key)
-        self._last_model = HF_MODELS[0]
+        self._last_model = HF_MODEL
+        # Cloudflare Workers AI speaks the OpenAI chat-completions schema, so
+        # the same InferenceClient call shape works with a swapped base_url.
+        self._cf_client = None
+        if CF_ACCOUNT_ID and CF_API_TOKEN:
+            self._cf_client = HFClient(
+                base_url=f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1",
+                token=CF_API_TOKEN,
+            )
+        else:
+            log.warning("[deepseek] Cloudflare fallback disabled "
+                        "(CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN unset)")
+
+    def _providers(self):
+        """(client, model) in priority order: HF primary, Cloudflare free fallback."""
+        yield self._client, HF_MODEL
+        if self._cf_client is not None:
+            for model in CF_MODELS:
+                yield self._cf_client, model
 
     def _call(self, system: str, user: str) -> Tuple[str, int, int]:
-        """Try each HF model in order; fall through on error."""
+        """Try each provider/model in order; fall through on error."""
         last_exc = None
-        for model in HF_MODELS:
+        for client, model in self._providers():
             try:
-                resp = self._client.chat_completion(
+                resp = client.chat_completion(
                     model=model,
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
                     ],
-                    max_tokens=300,
+                    max_tokens=500,
                     temperature=0.1,
                 )
-                self._last_model = model
                 raw = resp.choices[0].message.content or ""
+                if not raw.strip():
+                    # Reasoning-only models answer in `reasoning` and leave
+                    # `content` empty; that is a failure for our JSON schema.
+                    raise ValueError("empty content (reasoning-only response)")
+                self._last_model = model
                 in_tok = getattr(getattr(resp, "usage", None), "prompt_tokens", 0) or 0
                 out_tok = getattr(getattr(resp, "usage", None), "completion_tokens", 0) or 0
                 return raw, in_tok, out_tok
@@ -78,7 +112,7 @@ class DeepSeekRisk(LLMClient):
                 log.warning("[deepseek] Model %s failed (%s) -- trying next", model, str(exc)[:80])
                 last_exc = exc
                 continue
-        raise RuntimeError(f"All HF models failed: {last_exc}")
+        raise RuntimeError(f"All risk-audit models failed: {last_exc}")
 
     def _actual_cost_usd(self, in_tok: int, out_tok: int) -> float:
         # HF Inference API is on user's plan; $0.001 placeholder per call

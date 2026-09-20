@@ -19,7 +19,7 @@ yfinance ^DJI bar ─▶ feature extraction (ATR-14, SMA-200, Donchian-20, swing
    1. Claude (Anthropic)     — structural read. Sonnet via subscription SDK on
                                crucial bars (position open), else Haiku API
    2. Gemini (API)           — action: open_long | open_short | close | add_pyramid | hold
-   3. DeepSeek (HF)          — advisory risk audit (recorded for /disagreements; non-blocking)
+   3. DeepSeek (HF) / Workers AI (CF) — advisory risk audit (recorded for /disagreements; non-blocking)
             │
             ▼
    4. Python final_check     — HARD override (daily-loss, size, stop, ATR bounds)
@@ -38,10 +38,18 @@ config file can override the rails in `src/config.py`.
   on your Pro plan's included usage for crucial bars, **Haiku** API otherwise and as
   fallback), Gemini (execution, via the Gemini **API** — Google retired the
   individual-tier `gemini-cli` on 2026-06-18, so it is off by default),
-  DeepSeek/Qwen (**advisory** risk audit). Each call is logged. DeepSeek's verdict is
+  DeepSeek (**advisory** risk audit). Each call is logged. DeepSeek's verdict is
   recorded for the `/disagreements` view but no longer gates execution — the
   deterministic `final_check` rails are the sole safety authority. With no
   subscription token everything runs on the metered Haiku API.
+- **The risk auditor spans two providers.** `deepseek-ai/DeepSeek-V4.1-Flash` on
+  Hugging Face, falling back to `@cf/mistralai/mistral-small-3.1-24b-instruct` and
+  `@cf/meta/llama-4-scout-17b-16e-instruct` on Cloudflare Workers AI. The fallbacks
+  sit on a **different billing rail** on purpose: the previous chain was four
+  Hugging Face models, so one exhausted credit balance returned 402 for all of them
+  at once and the leg was silently dead from 2026-09-15. Cloudflare's free tier
+  covers roughly 600 risk audits a day. Models that answer in `reasoning` and leave
+  `content` empty cannot satisfy the JSON schema and were excluded by measurement.
 - **Hard safety layer** — `final_check` enforces max daily loss ($200), fixed risk
   per trade ($50), max open contracts, mandatory stop-loss, ATR-bounded stops,
   no averaging down, flat-before-weekend.
@@ -74,6 +82,11 @@ cp .env.example .env        # fill in API keys + cert credentials
 
 Required in `.env`: `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `HUGGINGFACE_API_KEY`,
 and the `TASTYTRADE_CERT_*` sandbox credentials. See `.env.example`.
+
+**Recommended — Cloudflare Workers AI fallback.** Set `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_API_TOKEN` (the token needs only **Account > Workers AI > Read**) to give
+the risk auditor a free fallback on a separate billing rail. Without them the leg is
+Hugging Face only, and a spent credit balance takes all of it down at once.
 
 **Optional — Claude Sonnet via subscription.** To run the structural judge on Claude
 **Sonnet** through the Claude Agent SDK (free ~$20/mo subscription credit instead of
