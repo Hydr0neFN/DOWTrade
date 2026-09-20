@@ -19,7 +19,7 @@ yfinance ^DJI bar ─▶ feature extraction (ATR-14, SMA-200, Donchian-20, swing
    1. Claude (Anthropic)     — structural read. Sonnet via subscription SDK on
                                crucial bars (position open), else Haiku API
    2. Gemini (API)           — action: open_long | open_short | close | add_pyramid | hold
-   3. DeepSeek (HF) / Workers AI (CF) — advisory risk audit (recorded for /disagreements; non-blocking)
+   3. DeepSeek (HF) / Workers AI (CF) — advisory risk audit (recorded for /decisions; non-blocking)
             │
             ▼
    4. Python final_check     — HARD override (daily-loss, size, stop, ATR bounds)
@@ -39,7 +39,7 @@ config file can override the rails in `src/config.py`.
   fallback), Gemini (execution, via the Gemini **API** — Google retired the
   individual-tier `gemini-cli` on 2026-06-18, so it is off by default),
   DeepSeek (**advisory** risk audit). Each call is logged. DeepSeek's verdict is
-  recorded for the `/disagreements` view but no longer gates execution — the
+  recorded for the `/decisions` view but no longer gates execution — the
   deterministic `final_check` rails are the sole safety authority. With no
   subscription token everything runs on the metered Haiku API.
 - **The risk auditor spans two providers.** `deepseek-ai/DeepSeek-V4.1-Flash` on
@@ -50,16 +50,26 @@ config file can override the rails in `src/config.py`.
   at once and the leg was silently dead from 2026-09-15. Cloudflare's free tier
   covers roughly 600 risk audits a day. Models that answer in `reasoning` and leave
   `content` empty cannot satisfy the JSON schema and were excluded by measurement.
-- **Hard safety layer** — `final_check` enforces max daily loss ($200), fixed risk
-  per trade ($50), max open contracts, mandatory stop-loss, ATR-bounded stops,
-  no averaging down, flat-before-weekend.
+- **Hard safety layer** — `final_check` enforces max daily loss
+  (`MAX_DAILY_LOSS_USD`, $600), fixed risk per trade
+  (`FIXED_RISK_PER_TRADE_USD`, $250), max open contracts
+  (`MAX_OPEN_CONTRACTS`, 3), mandatory stop-loss, ATR-bounded stops, no
+  averaging down, flat-before-weekend. These are module constants in
+  `src/config.py`, not env vars — they are asserted at startup and nothing in
+  the environment can move them.
 - **Golden/death cross filter** — entries require SMA 20/50 cross agreement on both
   the 15m and 1hr timeframes (trend-following discipline).
-- **Sim-fills** — `SIM_FILLS=1` synthesizes fills locally at bar close and tracks up
-  to 5 concurrent positions, persisted across restarts in `sim_state` /
-  `sim_positions` tables (the broker's cert sandbox cannot fill orders).
-- **Dashboard** — FastAPI + Jinja2: equity, day P&L, per-LLM reasoning cards, and a
-  yfinance heartbeat to detect silent stalls.
+- **Sim-fills** — `SIM_FILLS=1` synthesizes fills locally at bar close and tracks
+  the open lots (an entry plus its pyramid adds, aggregated into one position
+  before the LLMs ever see it), persisted across restarts in `sim_state` /
+  `sim_positions` tables (the broker's cert sandbox cannot fill orders). Total
+  size is bounded by `MAX_OPEN_CONTRACTS`, not by a separate lot count.
+- **Dashboard** — FastAPI + Jinja2 in **zh-TW and English** (switch at
+  `/lang/{code}`; strings in `src/dashboard/i18n.py`, kept byte-identical with
+  the trader dashboard): equity, day P&L, per-LLM reasoning cards, and a
+  yfinance heartbeat to detect silent stalls. `/` and `/decisions` are the two
+  real pages; `/equity`, `/trades`, `/journal` and `/disagreements` are kept as
+  redirects so older links still resolve.
 - **Daily journal** — APScheduler writes an end-of-day review.
 
 ## Market data & broker
@@ -87,6 +97,7 @@ and the `TASTYTRADE_CERT_*` sandbox credentials. See `.env.example`.
 `CLOUDFLARE_API_TOKEN` (the token needs only **Account > Workers AI > Read**) to give
 the risk auditor a free fallback on a separate billing rail. Without them the leg is
 Hugging Face only, and a spent credit balance takes all of it down at once.
+`HF_RISK_MODEL` overrides the primary model without touching the code.
 
 **Optional — Claude Sonnet via subscription.** To run the structural judge on Claude
 **Sonnet** through the Claude Agent SDK (free ~$20/mo subscription credit instead of
@@ -124,7 +135,7 @@ src/
 ├── safety/              # guard layer
 ├── sizing/              # risk-unit position sizing
 ├── db/                  # schema.sql + repo (raw sqlite, no ORM)
-├── dashboard/           # FastAPI + Jinja2
+├── dashboard/           # FastAPI + Jinja2, i18n.py, static/theme.css
 ├── journal/             # daily review (APScheduler)
 └── backtest/            # harness: final_check, compute_size, _PositionState
 tests/
