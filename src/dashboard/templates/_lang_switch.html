@@ -1,0 +1,11 @@
+{# Language toggle. Carries the page you are on — filters included — as ?next=
+   so switching keeps your place instead of resetting you to the overview. #}
+{% set nxt = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+<li class="nav-item ms-lg-2 mt-2 mt-lg-0">
+  <span class="lang-switch" data-lang="{{ lang }}" title="{{ t('lang.toggle_title') }}">
+    <a href="/lang/zh?next={{ nxt | urlencode }}" class="lang-opt {% if lang == 'zh' %}active{% endif %}"
+       data-target-lang="zh" lang="zh-Hant" aria-label="繁體中文">中</a>
+    <a href="/lang/en?next={{ nxt | urlencode }}" class="lang-opt {% if lang == 'en' %}active{% endif %}"
+       data-target-lang="en" lang="en" aria-label="English">EN</a>
+  </span>
+</li>

@@ -55,3 +55,8 @@ graphify-out/
 
 # Local backups
 *.bak-*
+
+# Timestamped backups (*.bak.YYYYMMDD) -- the existing *.bak-* rule misses these
+*.bak
+*.bak.*
+*.bak2.*

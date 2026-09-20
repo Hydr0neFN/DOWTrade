@@ -3,83 +3,97 @@
 
 {% block content %}
 <!-- Top stat row -->
-<div class="row g-3 mb-3">
-  <div class="col-6 col-md-3">
+<div class="row g-3 mb-4">
+  <div class="col-6 col-lg-3">
     <div class="card stat-card h-100">
       <div class="card-body">
-        <div class="stat-label">Equity</div>
-        <div class="stat-value text-white" id="acct-equity">${{ "{:,.2f}".format(account.equity) }}</div>
-        <div class="text-secondary" style="font-size:.72rem;" id="acct-asof">As of {{ account.as_of }}</div>
+        <div class="stat-label">{{ Lb('stat.equity') }}</div>
+        <div class="stat-value text-white mono" id="acct-equity">${{ "{:,.2f}".format(account.equity) }}</div>
+        <div class="stat-sub">{{ t('sub.as_of', date='<span id="acct-asof">' ~ account.as_of ~ '</span>') | safe }}</div>
       </div>
     </div>
   </div>
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg-3">
     <div class="card stat-card h-100">
       <div class="card-body">
-        <div class="stat-label">Day P&amp;L</div>
-        <div class="stat-value {% if account.day_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}" id="acct-day-pnl">${{ "{:,.2f}".format(account.day_pnl) }}</div>
-        <div class="text-secondary" style="font-size:.72rem;"><span id="acct-trades">{{ account.trades }}</span> trade(s) &middot; <span id="acct-commission">${{ "{:,.2f}".format(account.commission) }}</span> comm</div>
+        <div class="stat-label">{{ Lb('stat.day_pnl') }}</div>
+        <div class="stat-value mono {% if account.day_pnl >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}" id="acct-day-pnl">${{ "{:,.2f}".format(account.day_pnl) }}</div>
+        <div class="stat-sub">{{ t('sub.trades_comm', n='<span id="acct-trades">' ~ account.trades ~ '</span>', x='<span id="acct-commission">$' ~ "{:,.2f}".format(account.commission) ~ '</span>') | safe }}</div>
       </div>
     </div>
   </div>
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg-3">
     <div class="card stat-card h-100">
       <div class="card-body">
-        <div class="stat-label">Position</div>
+        <div class="stat-label">{{ Lb('stat.position') }}</div>
         <div class="stat-value text-white">
           <span id="pos-side">{{ position.side }}</span>
-          <span class="text-secondary" style="font-size:1rem;font-weight:500;">x<span id="pos-qty">{{ position.qty }}</span></span>
+          <span class="mono" style="font-size:1rem;font-weight:500;color:var(--muted);">&times;<span id="pos-qty">{{ position.qty }}</span></span>
         </div>
-        <div class="text-secondary" style="font-size:.72rem;">avg <span id="pos-avg">{{ position.avg_price }}</span> &middot; uPnL <span id="pos-unrealized">{{ position.unrealized }}</span></div>
+        <div class="stat-sub mono">{{ t('sub.avg_upnl', price='<span id="pos-avg">' ~ position.avg_price ~ '</span>', x='<span id="pos-unrealized">' ~ position.unrealized ~ '</span>') | safe }}</div>
       </div>
     </div>
   </div>
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg-3">
     <div class="card stat-card h-100">
       <div class="card-body">
-        <div class="stat-label">Last Decision</div>
+        <div class="stat-label">{{ Lb('stat.last_decision') }}</div>
         <div class="stat-value text-white" id="last-decision-dir">&mdash;</div>
-        <div class="text-secondary" style="font-size:.72rem;">
-          <span id="last-decision-time">&mdash;</span><br>
-          <span class="heartbeat-dot hb-bad" id="hb-dot"></span><span id="hb-text">poller: &mdash;</span>
-        </div>
+        <div class="stat-sub mono" id="last-decision-time">&mdash;</div>
       </div>
     </div>
   </div>
 </div>
 
-<!-- Recent decisions preview -->
-<div class="card mb-3">
-  <div class="card-header d-flex align-items-center justify-content-between">
-    <span><i class="bi bi-diagram-3 me-2"></i>Recent Decisions</span>
-    <a href="/disagreements" class="btn btn-sm btn-outline-secondary">View all</a>
-  </div>
+{# The equity curve was a tab of its own holding nothing but this canvas. #}
+<div class="card mb-4">
+  <div class="card-header"><i class="bi bi-bar-chart-line me-2"></i>{{ L('sec.equity_curve') }} <span class="hint ms-2">{{ t('sec.equity_curve_hint') }}</span></div>
   <div class="card-body">
-    {% if not decisions %}
-      <p class="text-secondary mb-0">No decisions yet.</p>
-    {% else %}
-      <div class="row g-2">
-        {% for d in decisions %}
-          <div class="col-12 col-md-4">
-            <div class="card h-100">
-              <div class="card-body">
-                <div class="d-flex justify-content-between align-items-start mb-2">
-                  <span class="text-secondary" style="font-size:.78rem;font-family:monospace;">{{ d.bar_ts }}</span>
-                  {% set dir = (d.direction or 'FLAT') | upper %}
-                  {% if dir == 'LONG' %}<span class="badge badge-long">LONG</span>
-                  {% elif dir == 'SHORT' %}<span class="badge badge-short">SHORT</span>
-                  {% else %}<span class="badge badge-flat">FLAT</span>{% endif %}
-                </div>
-                <div class="text-secondary" style="font-size:.78rem;">conf {{ "%.2f" | format(d.confidence or 0) }} &middot; entry ${{ "%.2f" | format(d.entry_price or 0) }}</div>
-                {% if d.safety_ok == 0 %}
-                  <div class="mt-2"><span class="badge badge-rejected" style="font-size:.65rem;">REJECTED</span> <span class="text-secondary" style="font-size:.7rem;">{{ (d.safety_notes or '') | truncate(40) }}</span></div>
-                {% endif %}
-              </div>
-            </div>
-          </div>
-        {% endfor %}
-      </div>
-    {% endif %}
+    <div class="chart-container"><canvas id="equityChart"></canvas></div>
+    <p class="text-center mt-3 hint" id="equityEmpty" hidden>{{ t('empty.no_equity') }}</p>
   </div>
+</div>
+
+{# Likewise /trades: a bare page whose rows were built by string concatenation
+   in app.js. Rendered server-side here, same as every other table. #}
+<div class="card mb-4">
+  <div class="card-header d-flex align-items-center justify-content-between">
+    <span><i class="bi bi-receipt me-2"></i>{{ L('sec.recent_orders') }}</span>
+    <span class="hint">{{ t('sec.recent_orders_hint', n=trades | length) }}</span>
+  </div>
+  {% if not trades %}
+  <div class="card-body text-center py-5 hint">
+    <i class="bi bi-inbox display-6 d-block mb-2"></i>{{ t('empty.no_orders') }}
+  </div>
+  {% else %}
+  <div class="table-responsive">
+    <table class="table table-dark table-hover mb-0 align-middle">
+      <thead class="thead-sub">
+        <tr>
+          <th class="ps-3">{{ Lb('col.time') }}</th>
+          <th>{{ Lb('col.side') }}</th>
+          <th class="text-end">{{ Lb('col.qty') }}</th>
+          <th class="text-end">{{ Lb('col.fill') }}</th>
+          <th class="col-secondary">{{ Lb('col.symbol') }}</th>
+          <th class="col-secondary pe-3">{{ Lb('col.status') }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for t in trades %}
+        <tr>
+          <td class="ps-3 hint mono" style="white-space:nowrap;">{{ t.ts_human }}</td>
+          <td>
+            <span class="badge {% if t.side == 'BUY' %}badge-long{% else %}badge-short{% endif %}">{{ t.side }}</span>
+          </td>
+          <td class="text-end mono">{{ t.qty }}</td>
+          <td class="text-end mono">{% if t.fill_price %}${{ "%.2f" | format(t.fill_price) }}{% else %}&mdash;{% endif %}</td>
+          <td class="col-secondary mono">{{ t.symbol }}</td>
+          <td class="col-secondary pe-3 hint">{{ t.status }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
 </div>
 {% endblock %}
