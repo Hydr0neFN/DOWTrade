@@ -16,8 +16,10 @@ import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from src.config import (
     MAX_DAILY_LOSS_USD,
@@ -56,12 +58,37 @@ class CostBudgetExceeded(RuntimeError):
 # Cost tracker
 # ---------------------------------------------------------------------------
 
+_ET = ZoneInfo("America/New_York")
+
+
 class CostTracker:
-    def __init__(self, cap_usd: float = MAX_LLM_SPEND_USD) -> None:
+    """Spend against MAX_LLM_SPEND_USD, which is a MONTHLY cap ($30/mo).
+
+    The total resets when the US/Eastern calendar month changes. It used to
+    accumulate for the life of the process, so a long uptime turned the monthly
+    cap into a lifetime one and the bot then ran with no LLM decisions at all.
+    """
+
+    def __init__(self, cap_usd: float = MAX_LLM_SPEND_USD,
+                 clock: Optional[Callable[[], datetime]] = None) -> None:
         self._total: float = 0.0
         self._cap: float = cap_usd
+        self._clock = clock or (lambda: datetime.now(_ET))
+        self._month: str = self._month_key()
+
+    def _month_key(self) -> str:
+        return self._clock().astimezone(_ET).strftime("%Y-%m")
+
+    def _roll(self) -> None:
+        month = self._month_key()
+        if month != self._month:
+            log.info("LLM budget: new month %s, resetting spend (was $%.4f)",
+                     month, self._total)
+            self._month = month
+            self._total = 0.0
 
     def authorize(self, estimated_cost_usd: float) -> None:
+        self._roll()
         if self._total + estimated_cost_usd > self._cap:
             raise CostBudgetExceeded(
                 f"Budget cap would be exceeded "
@@ -69,10 +96,12 @@ class CostTracker:
             )
 
     def record(self, actual_cost_usd: float) -> None:
+        self._roll()
         self._total += actual_cost_usd
 
     @property
     def total_usd(self) -> float:
+        self._roll()
         return self._total
 
 

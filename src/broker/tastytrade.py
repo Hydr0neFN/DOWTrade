@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
@@ -30,7 +31,7 @@ import httpx
 
 from src.broker.base import Bar, Broker
 from src.broker.models import AccountState, Order, Position
-from src.config import Settings
+from src.config import SYMBOL, Settings
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -48,10 +49,20 @@ _MONTH_CODES: dict[int, str] = {
 
 log = logging.getLogger(BROKER_NAME)
 
+# Stop-leg retry schedule (seconds slept BEFORE each retry). A filled entry
+# with no stop breaks MANDATORY_STOP_LOSS, so a failed stop POST is retried
+# before the entry is unwound.
+_STOP_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _symbol_root(raw_symbol: str) -> str:
+    """'/MYMZ6', '/MYMZ26', '/MYMZ6:XCME' -> 'MYM'. Non-futures symbols come back as-is."""
+    return re.sub(r"^/([A-Z]+)[FGHJKMNQUVXZ]\d{1,2}(?::[A-Z]+)?$", r"\1", raw_symbol)
+
 
 def _redact(text: str, *secrets: str) -> str:
     """Replace every occurrence of a secret in text with ***."""
@@ -145,6 +156,7 @@ class TastytradeBroker(Broker):
         self._settings = settings
         self._session_token: Optional[str] = None
         self._account_number: Optional[str] = None
+        self._sleep = time.sleep  # injectable so tests skip the backoff
         self._client = httpx.Client(
             base_url=settings.tastytrade_base_url,
             timeout=15.0,
@@ -299,15 +311,20 @@ class TastytradeBroker(Broker):
 
         realized_today: float = float(bal.get("realized-day-gain", 0) or 0)
 
-        unrealized_total: float = sum(
-            float(p.get("unrealized-day-gain-value", 0) or 0)
-            for p in positions_raw
-        )
-
+        # Match on the traded root, exactly as get_position() does. Taking the
+        # first Future of ANY root let a stray position (another contract, a
+        # manual test trade) feed the wrong side/qty/PnL into final_check; the
+        # same stray PnL must not count toward the daily-loss rail either.
         mym_positions = [
             p for p in positions_raw
             if p.get("instrument-type") == "Future"
+            and _symbol_root(p.get("symbol", "")) == SYMBOL
         ]
+
+        unrealized_total: float = sum(
+            float(p.get("unrealized-day-gain-value", 0) or 0)
+            for p in mym_positions
+        )
 
         position: Position
         if mym_positions:
@@ -388,6 +405,14 @@ class TastytradeBroker(Broker):
             BROKER_NAME, tt_symbol, order.side, order.qty,
         )
 
+        # Same-side qty BEFORE the entry. If the stop leg later fails, only the
+        # growth above this baseline is ours to flatten: an entry cancelled
+        # unfilled must not liquidate a pre-existing lot (whose own stop would
+        # then fire against a flat account and open a reverse position).
+        # Without a baseline a safe unwind is impossible, so do not enter.
+        pre = self.get_position(order.symbol)
+        pre_same_qty = pre.qty if pre.side == order.side else 0
+
         entry_resp = self._request("POST", f"/accounts/{acct}/orders", json=payload)
         entry_data = entry_resp.json().get("data", {}).get("order", {})
         broker_order_id: str = str(entry_data.get("id", ""))
@@ -416,16 +441,11 @@ class TastytradeBroker(Broker):
                 },
             ],
         }
-        try:
-            self._request("POST", f"/accounts/{acct}/orders", json=stop_payload)
-            log.info(
-                "[%s] Stop-loss order submitted symbol=%s stop_price=%s",
-                BROKER_NAME, tt_symbol, order.stop_price,
-            )
-        except RuntimeError as exc:
-            log.warning(
-                "[%s] Stop-loss submission failed (entry order still placed): %s",
-                BROKER_NAME, exc,
+        if not self._submit_stop_with_retry(acct, stop_payload, tt_symbol, order.stop_price):
+            self._unwind_unprotected_entry(order, broker_order_id, tt_symbol, pre_same_qty)
+            raise RuntimeError(
+                f"[{BROKER_NAME}] stop-loss leg failed after "
+                f"{len(_STOP_RETRY_DELAYS) + 1} attempts; entry unwound"
             )
 
         order.status = our_status
@@ -435,6 +455,84 @@ class TastytradeBroker(Broker):
             order.order_id = broker_order_id
         log.info("[%s] Order submitted broker_id=*** status=%s", BROKER_NAME, our_status)
         return order
+
+    def _submit_stop_with_retry(self, acct: str, stop_payload: dict,
+                                tt_symbol: str, stop_price: float) -> bool:
+        """POST the stop leg, retrying with backoff. True once it is accepted."""
+        delays = (0.0,) + _STOP_RETRY_DELAYS
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                self._sleep(delay)
+            try:
+                self._request("POST", f"/accounts/{acct}/orders", json=stop_payload)
+                log.info(
+                    "[%s] Stop-loss order submitted symbol=%s stop_price=%s (attempt %d)",
+                    BROKER_NAME, tt_symbol, stop_price, attempt,
+                )
+                return True
+            except (RuntimeError, httpx.HTTPError) as exc:
+                log.warning(
+                    "[%s] Stop-loss submission failed (attempt %d/%d): %s",
+                    BROKER_NAME, attempt, len(delays), exc,
+                )
+        return False
+
+    def _unwind_unprotected_entry(self, order: Order, broker_order_id: str,
+                                  tt_symbol: str, pre_same_qty: int) -> None:
+        """The stop leg could not be placed: never leave the entry without one.
+
+        Cancel the entry if it is still working, then flatten whatever of it
+        already filled with a market order. Any failure here is logged CRITICAL
+        -- at that point a human has to look at the account.
+        """
+        acct = self._get_account_number()
+        if broker_order_id:
+            try:
+                self.cancel_order(broker_order_id)
+            except (RuntimeError, httpx.HTTPError) as exc:
+                # Expected when the entry already filled (Market entries do).
+                log.warning("[%s] Entry cancel failed (probably filled): %s",
+                            BROKER_NAME, exc)
+        try:
+            pos = self.get_position(order.symbol)
+        except (RuntimeError, httpx.HTTPError) as exc:
+            log.critical(
+                "[%s] UNPROTECTED ENTRY: stop leg failed and position lookup "
+                "failed -- check the account manually: %s", BROKER_NAME, exc,
+            )
+            return
+        # Close only what this entry added: a pre-existing lot of the same
+        # side keeps its own stop and is not ours to flatten.
+        now_same_qty = pos.qty if pos.side == order.side else 0
+        flatten_qty = min(order.qty, now_same_qty - pre_same_qty)
+        if flatten_qty <= 0:
+            log.error("[%s] Stop leg failed; entry cancelled before any fill",
+                      BROKER_NAME)
+            return
+        is_long = order.side == "long"
+        close_payload = {
+            "order-type": "Market",
+            "price-effect": "Credit" if is_long else "Debit",
+            "time-in-force": "Day",
+            "legs": [
+                {
+                    "instrument-type": "Future",
+                    "symbol": tt_symbol,
+                    "quantity": str(flatten_qty),
+                    "action": "Sell to Close" if is_long else "Buy to Close",
+                },
+            ],
+        }
+        try:
+            self._request("POST", f"/accounts/{acct}/orders", json=close_payload)
+            log.error("[%s] Stop leg failed; flattened %d filled contract(s)",
+                      BROKER_NAME, flatten_qty)
+        except (RuntimeError, httpx.HTTPError) as exc:
+            log.critical(
+                "[%s] UNPROTECTED POSITION: stop leg AND flatten failed "
+                "(%s %d) -- check the account manually: %s",
+                BROKER_NAME, order.side, flatten_qty, exc,
+            )
 
     def cancel_order(self, broker_order_id: str) -> None:
         """DELETE /accounts/{acct}/orders/{id}."""
@@ -462,7 +560,7 @@ class TastytradeBroker(Broker):
                 side: str = "long" if "Buy" in action_raw else "short"
                 qty = int(leg.get("remaining-quantity", leg.get("quantity", 1)) or 1)
                 symbol_raw = leg.get("symbol", "MYM")
-                root = re.sub(r"^/([A-Z]+)[A-Z]\d$", r"\1", symbol_raw)
+                root = _symbol_root(symbol_raw)
                 o = Order(
                     order_id=str(item.get("id", "")),
                     symbol=root,
@@ -494,7 +592,7 @@ class TastytradeBroker(Broker):
         symbol_upper = symbol.upper()
         for p in items:
             raw_symbol: str = p.get("symbol", "")
-            root = re.sub(r"^/([A-Z]+)[A-Z]\d$", r"\1", raw_symbol)
+            root = _symbol_root(raw_symbol)
             if root == symbol_upper:
                 qty_signed = int(p.get("quantity", 0) or 0)
                 direction = p.get("quantity-direction", "Long")

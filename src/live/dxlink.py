@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 from typing import Callable, Optional
 
 import websockets
@@ -132,21 +133,27 @@ class DxLinkStreamer:
                     def _num(x, default=0.0):
                         try:
                             f = float(x)
-                            import math as _m
-                            return default if _m.isnan(f) else f
+                            return default if math.isnan(f) else f
                         except (TypeError, ValueError):
                             return default
                     try:
                         t_ms = int(_num(chunk[1], default=0))
                         if t_ms <= 0:
                             continue  # tombstone / empty chunk
+                        # Prices have NO default: a NaN/missing price used to
+                        # become 0.0, i.e. a real-looking bar at price zero.
+                        # Drop the candle instead (volume may default to 0).
+                        prices = [_num(chunk[k], default=None) for k in (2, 3, 4, 5)]
+                        if any(p is None or p <= 0 for p in prices):
+                            log.warning("Skipped candle with missing/NaN price: chunk=%r", chunk)
+                            continue
                         candle = {
                             "eventSymbol": chunk[0],
                             "time": t_ms,
-                            "open": _num(chunk[2]),
-                            "high": _num(chunk[3]),
-                            "low": _num(chunk[4]),
-                            "close": _num(chunk[5]),
+                            "open": prices[0],
+                            "high": prices[1],
+                            "low": prices[2],
+                            "close": prices[3],
                             "volume": _num(chunk[6]),
                         }
                     except Exception as _e:

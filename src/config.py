@@ -113,31 +113,41 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
 
 
+def _require(ok: bool, msg: str) -> None:
+    # Explicit check, NOT `assert`: python -O / PYTHONOPTIMIZE strips asserts,
+    # which would silently remove every paper/cert/demo rail below.
+    if not ok:
+        raise SystemExit(msg)
+
+
 def assert_safety_posture(settings: Settings) -> None:
     """
-    Startup assertion. Called from main.py and any entry point that may
+    Startup check. Called from main.py and any entry point that may
     place a real order. Refuses to continue outside paper-mode.
     """
-    assert PAPER_ONLY is True, "Refusing to start: PAPER_ONLY must be True."
-    assert BROKER_ENV == "demo", "Refusing to start: BROKER_ENV must be 'demo'."
-    assert SYMBOL == "MYM", "Refusing to start: SYMBOL locked to MYM."
-    assert "demo" in settings.tradovate_base_url.lower(), (
+    _require(PAPER_ONLY is True, "Refusing to start: PAPER_ONLY must be True.")
+    _require(BROKER_ENV == "demo", "Refusing to start: BROKER_ENV must be 'demo'.")
+    _require(SYMBOL == "MYM", "Refusing to start: SYMBOL locked to MYM.")
+    _require(
+        "demo" in settings.tradovate_base_url.lower(),
         f"Refusing to start: Tradovate URL is not demo "
-        f"({settings.tradovate_base_url!r})."
+        f"({settings.tradovate_base_url!r}).",
     )
-    assert "cert" in settings.tastytrade_streamer_url.lower(), (
-        f"Refusing: Tastytrade streamer must be sandbox/cert ({settings.tastytrade_streamer_url!r})"
+    _require(
+        "cert" in settings.tastytrade_streamer_url.lower(),
+        f"Refusing: Tastytrade streamer must be sandbox/cert ({settings.tastytrade_streamer_url!r})",
     )
-    assert "cert" in settings.tastytrade_base_url.lower(), (
-        f"Refusing: Tastytrade URL must be sandbox/cert ({settings.tastytrade_base_url!r})"
+    _require(
+        "cert" in settings.tastytrade_base_url.lower(),
+        f"Refusing: Tastytrade URL must be sandbox/cert ({settings.tastytrade_base_url!r})",
     )
-    assert MANDATORY_STOP_LOSS is True
-    assert NO_AVERAGING_DOWN is True
-    assert MAX_DAILY_LOSS_USD > 0
-    assert FIXED_RISK_PER_TRADE_USD > 0
-    assert MAX_OPEN_CONTRACTS >= 1
-    assert 1 <= MAX_PYRAMID_ADDS <= 5
-    assert POINT_VALUE_USD > 0
+    _require(MANDATORY_STOP_LOSS is True, "Refusing to start: MANDATORY_STOP_LOSS must be True.")
+    _require(NO_AVERAGING_DOWN is True, "Refusing to start: NO_AVERAGING_DOWN must be True.")
+    _require(MAX_DAILY_LOSS_USD > 0, "Refusing to start: MAX_DAILY_LOSS_USD must be > 0.")
+    _require(FIXED_RISK_PER_TRADE_USD > 0, "Refusing to start: FIXED_RISK_PER_TRADE_USD must be > 0.")
+    _require(MAX_OPEN_CONTRACTS >= 1, "Refusing to start: MAX_OPEN_CONTRACTS must be >= 1.")
+    _require(1 <= MAX_PYRAMID_ADDS <= 5, "Refusing to start: MAX_PYRAMID_ADDS must be 1..5.")
+    _require(POINT_VALUE_USD > 0, "Refusing to start: POINT_VALUE_USD must be > 0.")
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent

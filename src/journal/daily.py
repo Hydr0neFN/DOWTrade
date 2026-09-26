@@ -9,6 +9,45 @@ from src.config import Settings
 
 log = logging.getLogger(__name__)
 
+
+def _direction(v) -> str | None:
+    """Normalise a vote to up / down / flat; None if the agent did not vote.
+
+    Same rules as the dashboard's /disagreements view, so the journal's
+    agreement % and that page describe the same thing.
+    """
+    v = (v or "").lower()
+    if not v:
+        return None
+    if "up" in v or "long" in v or "buy" in v:
+        return "up"
+    if "down" in v or "short" in v or "sell" in v:
+        return "down"
+    return "flat"
+
+
+def _votes_agree(votes) -> bool:
+    """False only when the agents genuinely pulled against each other -- the
+    inverse of the dashboard's _disagrees(): opposite committed directions
+    from Haiku (trend) and Gemini (action), or a DeepSeek veto of a trade the
+    other two proposed. "trend up, hold" is two agents answering different
+    questions, not dissent. raw_votes is the dict the runner writes:
+    {"haiku": {...}, "gemini": {...}, "ds": {...}}; anything else (the legacy
+    list shape, unparseable rows) cannot be scored and counts as not agreed.
+    """
+    if not isinstance(votes, dict):
+        return False
+    h = _direction((votes.get("haiku") or {}).get("trend"))
+    g = _direction((votes.get("gemini") or {}).get("action"))
+    if h and g and h != g and "flat" not in (h, g):
+        return False
+    ds = votes.get("ds")
+    if isinstance(ds, dict) and not ds.get("approved"):
+        proposed = g or h
+        if proposed is not None and proposed != "flat":
+            return False
+    return True
+
 def generate_daily_journal(date_str: str, db: Database, anthropic_client=None) -> str:
     """Generate daily journal markdown."""
     if anthropic_client is None:
@@ -43,9 +82,7 @@ def generate_daily_journal(date_str: str, db: Database, anthropic_client=None) -
     
     for d in decisions:
         try:
-            votes = json.loads(d["raw_votes"])
-            dirs = [v.get("direction", v.get("trend", "FLAT")) for v in votes] if isinstance(votes, list) else []
-            if len(dirs) == 3 and len(set(dirs)) == 1:
+            if _votes_agree(json.loads(d["raw_votes"])):
                 agreed_count += 1
         except Exception:
             pass

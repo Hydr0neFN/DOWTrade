@@ -50,6 +50,22 @@ YF_HYDRATE_PERIOD = os.environ.get("YF_HYDRATE_PERIOD", "20d")
 
 log = logging.getLogger(__name__)
 
+
+def _valid_stop(raw) -> float:
+    """Gemini's stop_price as a usable price, or 0.0 meaning "no stop given".
+
+    Anything that is not a finite positive number (None, a string, NaN, a
+    negative) used to reach compute_size() as-is, whose ValueError dropped the
+    whole bar's decision pipeline. 0.0 routes it to the side-aware ATR fallback
+    stop instead, the same as a missing stop.
+    """
+    try:
+        f = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if math.isfinite(f) and f > 0 else 0.0
+
+
 class LiveRunner:
     # Use yfinance for market data when dxLink cert has no live data subscription.
     # Default ON. Set USE_YFINANCE=0 in .env to revert to dxLink streaming.
@@ -399,7 +415,6 @@ class LiveRunner:
                 vol_raw = candle.get("volume", 0)
                 try:
                     vol_f = float(vol_raw)
-                    import math
                     vol_int = 0 if math.isnan(vol_f) else int(vol_f)
                 except (ValueError, TypeError):
                     vol_int = 0
@@ -414,6 +429,20 @@ class LiveRunner:
                 )
                 
                 if len(self.window) > 0 and bar.ts <= self.window.as_list()[-1].ts:
+                    continue
+
+                # A bar with a missing/zero/NaN price must never reach the
+                # window: close=0 became entry=0 in compute_size (ValueError,
+                # bar dropped) and would also poison the indicators and the
+                # sim stop-check (bar.l=0 trips every long stop).
+                try:
+                    _ohlc_ok = all(math.isfinite(float(x)) and float(x) > 0
+                                   for x in (bar.o, bar.h, bar.l, bar.c))
+                except (TypeError, ValueError):
+                    _ohlc_ok = False
+                if not _ohlc_ok:
+                    log.warning("Dropping bar ts=%s with invalid OHLC (%r, %r, %r, %r)",
+                                bar.ts, bar.o, bar.h, bar.l, bar.c)
                     continue
 
                 self._last_mark = bar.c
@@ -578,7 +607,7 @@ class LiveRunner:
                 gemini_res = gemini_result.parsed or {"action": "hold", "stop_price": 0.0, "trailing_stop_atr_multiple": 2.0}
                 
                 action = gemini_res.get("action", "hold")
-                gem_stop = gemini_res.get("stop_price") or 0.0
+                gem_stop = _valid_stop(gemini_res.get("stop_price"))
                 mark_price = bar.c
                 if gem_stop:
                     order_stop = gem_stop

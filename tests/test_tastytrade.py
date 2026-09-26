@@ -254,7 +254,9 @@ class TestSubmitBracketOrder:
             stop_resp = _ok_response({
                 "data": {"order": {"id": "STOP-888", "status": "Received"}}
             }, status=201)
-            mock_client.request.side_effect = [entry_resp, stop_resp]
+            flat_resp = _ok_response({"data": {"items": []}})
+            # baseline positions GET, entry POST, stop POST
+            mock_client.request.side_effect = [flat_resp, entry_resp, stop_resp]
 
             order = Order(
                 order_id="local-1",
@@ -268,7 +270,7 @@ class TestSubmitBracketOrder:
             )
             result = broker.submit_bracket_order(order)
 
-            assert mock_client.request.call_count == 2
+            assert mock_client.request.call_count == 3
             assert result.status == "submitted"
             assert result.order_id == "ORD-999"
 
