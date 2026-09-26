@@ -7,6 +7,8 @@
 data/*.db
 data/*.db-shm
 data/*.db-wal
+# Claude SDK monthly credit ledger (CLAUDE_SDK_CREDIT_FILE in dowtrade.service)
+data/claude_sdk_credit.*
 
 # Logs
 logs/

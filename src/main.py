@@ -1,4 +1,5 @@
 import logging
+import os
 import asyncio
 import threading
 import signal
@@ -32,7 +33,12 @@ def main():
     t = threading.Thread(target=run_live, daemon=True)
     t.start()
     
-    uvicorn.run("src.dashboard.app:app", host="0.0.0.0", port=8000)
+    # Loopback by default: the Cloudflare tunnel ingress targets
+    # http://localhost:8000, so nothing needs the LAN bind (it exposed an
+    # unauthenticated dashboard to every host on the network). Set
+    # DASHBOARD_HOST=0.0.0.0 to get LAN access back.
+    host = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
+    uvicorn.run("src.dashboard.app:app", host=host, port=8000)
 
 if __name__ == "__main__":
     main()
