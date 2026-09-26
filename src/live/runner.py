@@ -342,7 +342,8 @@ class LiveRunner:
             self._start_equity_today = self._cash + self._open_unrealized()
             log.info("Reset daily state for %s (start_equity=%.2f)", day_str, self._start_equity_today)
 
-    def _sim_close_all(self, bar: DataBar, reason: str) -> None:
+    def _sim_close_all(self, bar: DataBar, reason: str,
+                       decision_id: Optional[int] = None) -> None:
         """Market-close every sim position at bar.c (Gemini close / weekend flat)."""
         closed_ids: set[int] = set()
         for pos in list(self._positions):
@@ -352,7 +353,7 @@ class LiveRunner:
             comm = self._commission(pos.qty)
             try:
                 close_order_id = self.db.insert_order({
-                    "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
+                    "ts": str(bar.ts), "decision_id": decision_id, "broker_id": "sim",
                     "symbol": "MYM", "side": db_close_side, "qty": pos.qty,
                     "order_type": "market", "limit_price": 0.0,
                     "stop_price": 0.0,
@@ -378,7 +379,7 @@ class LiveRunner:
                 log.error("sim close order/fill insert failed (%s), retrying once", exc)
                 try:
                     close_order_id = self.db.insert_order({
-                        "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
+                        "ts": str(bar.ts), "decision_id": decision_id, "broker_id": "sim",
                         "symbol": "MYM", "side": db_close_side, "qty": pos.qty,
                         "order_type": "market", "limit_price": 0.0,
                         "stop_price": 0.0,
@@ -540,7 +541,11 @@ class LiveRunner:
                         agg_pos = Position(
                             side=agg_side,
                             qty=sum(p.qty for p in self._positions),
-                            avg_price=self._positions[0].avg_price,
+                            # Qty-weighted, as harness.py does. Lot 0's price
+                            # misstated the average to the LLM prompts once
+                            # a pyramid lot was added at a different price.
+                            avg_price=(sum(p.avg_price * p.qty for p in self._positions)
+                                       / max(1, sum(p.qty for p in self._positions))),
                             unrealized_pnl=sim_unreal,
                             # Lots-as-adds model: per-lot pyramid_adds_used is
                             # always 0, so summing it always reported 0 adds to
@@ -639,16 +644,27 @@ class LiveRunner:
                     "disagreement_flags": {"haiku": haiku_res, "gemini": gemini_res, "ds": ds_res}
                 }
 
-                self.db.insert_decision({
-                    "bar_ts": str(bar.ts),
-                    "direction": direction,
-                    "confidence": float(haiku_res.get("confidence_0_to_1", 0.5) or 0.5),
-                    "stop_price": float(gem_stop or 0.0),
-                    "entry_price": float(bar.c),
-                    "raw_votes": raw_votes,
-                    "safety_ok": 1 if ds_res.get("approved") else 0,
-                    "safety_notes": str(ds_res.get("violations", [])),
-})
+                def _decision_row(safety_ok: int, safety_notes: str) -> dict:
+                    return {
+                        "bar_ts": str(bar.ts),
+                        "direction": direction,
+                        "confidence": float(haiku_res.get("confidence_0_to_1", 0.5) or 0.5),
+                        "stop_price": float(gem_stop or 0.0),
+                        "entry_price": float(bar.c),
+                        "raw_votes": raw_votes,
+                        "safety_ok": safety_ok,
+                        "safety_notes": safety_notes,
+                    }
+
+                # Kept so this bar's orders can reference it: every order used
+                # to carry decision_id=None, so /api/trades could never join an
+                # order to its decision or LLM calls. decisions is INSERT OR
+                # REPLACE on bar_ts, so a re-insert below gets a NEW id -- always
+                # take the latest. (insert_decision upserts in place on bar_ts,
+                # so the id is stable across the re-inserts below.)
+                decision_id = self.db.insert_decision(_decision_row(
+                    1 if ds_res.get("approved") else 0,
+                    str(ds_res.get("violations", []))))
                 
                 # DeepSeek is ADVISORY now: it is still recorded in raw_votes /
                 # safety_ok for the /disagreements audit, but it no longer gates
@@ -656,6 +672,7 @@ class LiveRunner:
                 # safety layer. Execution is gated by the cross-filter +
                 # guards.final_check (open) and a direct profitability check (pyramid).
                 mapped = None
+                cross_ok = False
                 if action == "open_long": mapped = ("long", "open")
                 elif action == "open_short": mapped = ("short", "open")
                 elif action == "close": mapped = ("close", "close")
@@ -670,22 +687,13 @@ class LiveRunner:
                         # direction/confidence/votes (don't zero them) and only
                         # mark it blocked, or the /disagreements audit loses the
                         # very LLM votes it exists to record.
-                        self.db.insert_decision({
-                            "bar_ts": str(bar.ts),
-                            "direction": direction,
-                            "confidence": float(haiku_res.get("confidence_0_to_1", 0.5) or 0.5),
-                            "stop_price": float(gem_stop or 0.0),
-                            "entry_price": float(bar.c),
-                            "raw_votes": raw_votes,
-                            "safety_ok": 0,
-                            "safety_notes": cross_reason,
-                        })
+                        decision_id = self.db.insert_decision(_decision_row(0, cross_reason))
                     else:
                         log.info("Cross filter passed: %s", cross_reason)
 
                 # --- close handler (no cross-filter, no final_check needed) ---
                 if action == "close" and SIM_FILLS and self._positions:
-                    self._sim_close_all(bar, reason="gemini-close")
+                    self._sim_close_all(bar, reason="gemini-close", decision_id=decision_id)
 
                 # --- add_pyramid handler ---
                 # DeepSeek demoted to advisory: gate the pyramid add on a DETERMINISTIC
@@ -693,7 +701,7 @@ class LiveRunner:
                 # LLM vote — same rule guards._check_pyramid / NO_AVERAGING_DOWN enforce.
                 if action == "add_pyramid" and SIM_FILLS \
                         and self._positions \
-                        and self._positions[0].unrealized_pnl(bar.c) > 0:
+                        and sum(p.unrealized_pnl(bar.c) for p in self._positions) > 0:
                     # A pyramid always adds to the existing position's side (this
                     # block only runs for action=="add_pyramid").
                     # HARD RAILS enforced here because this path bypasses
@@ -753,7 +761,7 @@ class LiveRunner:
                             pyr_db_side = "BUY" if pyramid_side == "long" else "SELL"
                             try:
                                 pyr_order_id = self.db.insert_order({
-                                    "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
+                                    "ts": str(bar.ts), "decision_id": decision_id, "broker_id": "sim",
                                     "symbol": "MYM", "side": pyr_db_side, "qty": pyr_qty,
                                     "order_type": "market", "limit_price": 0.0,
                                     "stop_price": pyr_stop,
@@ -797,7 +805,7 @@ class LiveRunner:
                 # this guard, action=="close" (mapped=("close","close")) fell
                 # through and built Order(side="close"), inserting a phantom SELL
                 # and a garbage side="close" position.
-                if mapped and mapped[1] == "open" and self._cross.allows(action)[0]:
+                if mapped and mapped[1] == "open" and cross_ok:
                     side, act = mapped
                     if exec_qty < 1:
                         log.info("skip %s: risk-unit size is 0 (stop too wide for $ budget)", action)
@@ -828,7 +836,7 @@ class LiveRunner:
                                 entry_stop = float(order.stop_price or 0.0)
                                 try:
                                     order_id = self.db.insert_order({
-                                        "ts": str(bar.ts), "decision_id": None, "broker_id": "sim",
+                                        "ts": str(bar.ts), "decision_id": decision_id, "broker_id": "sim",
                                         "symbol": order.symbol, "side": db_side, "qty": order.qty,
                                         "order_type": "market", "limit_price": 0.0,
                                         "stop_price": float(order.stop_price or 0.0),
@@ -869,18 +877,23 @@ class LiveRunner:
                                 self._save_sim_state()
                         else:
                             try:
-                                self.broker.submit_bracket_order(order)
+                                # Record what the broker actually said: a rejected
+                                # entry returns normally (no stop leg, no raise), and
+                                # was stored as "submitted".
+                                res = self.broker.submit_bracket_order(order)
                                 self.db.insert_order({
-                                    "ts": str(bar.ts), "decision_id": None, "broker_id": "",
+                                    "ts": str(bar.ts), "decision_id": decision_id,
+                                    "broker_id": str(getattr(res, "order_id", "") or ""),
                                     "symbol": order.symbol, "side": db_side, "qty": order.qty,
                                     "order_type": "bracket", "limit_price": 0.0,
                                     "stop_price": float(order.stop_price or 0.0),
-                                    "status": "submitted", "raw_response": "",
+                                    "status": str(getattr(res, "status", "") or "submitted"),
+                                    "raw_response": "",
                                 })
                             except Exception as e:
                                 log.error(f"Order submission failed: {e}")
                                 self.db.insert_order({
-                                    "ts": str(bar.ts), "decision_id": None, "broker_id": "",
+                                    "ts": str(bar.ts), "decision_id": decision_id, "broker_id": "",
                                     "symbol": order.symbol, "side": db_side, "qty": order.qty,
                                     "order_type": "bracket", "limit_price": 0.0,
                                     "stop_price": float(order.stop_price or 0.0),
@@ -890,16 +903,8 @@ class LiveRunner:
                         log.info("final_check rejected the order")
                         # Preserve the real direction/votes; only record the reject
                         # reason (see the cross-filter note above re: OR REPLACE).
-                        self.db.insert_decision({
-                            "bar_ts": str(bar.ts),
-                            "direction": direction,
-                            "confidence": float(haiku_res.get("confidence_0_to_1", 0.5) or 0.5),
-                            "stop_price": float(gem_stop or 0.0),
-                            "entry_price": float(bar.c),
-                            "raw_votes": raw_votes,
-                            "safety_ok": 0,
-                            "safety_notes": f"final_check rejected: {guard.reason}",
-                        })
+                        decision_id = self.db.insert_decision(_decision_row(
+                            0, f"final_check rejected: {guard.reason}"))
 
             except CostBudgetExceeded:
                 log.warning("CostBudgetExceeded. Stopping orders for the day.")

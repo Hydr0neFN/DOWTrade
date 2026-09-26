@@ -128,16 +128,32 @@ class Database:
     # ------------------------------------------------------------------
 
     def insert_decision(self, decision: Mapping[str, Any]) -> int:
+        # Upsert IN PLACE on bar_ts, keeping the row id. This used to be
+        # INSERT OR REPLACE, which deletes the old row and inserts a new one:
+        # the id changed on every re-insert, and once an order references the
+        # decision (orders.decision_id, foreign_keys=ON) replacing it raises
+        # IntegrityError.
         sql = """
-            INSERT OR REPLACE INTO decisions
+            INSERT INTO decisions
                 (bar_ts, direction, confidence, stop_price, entry_price,
                  raw_votes, safety_ok, safety_notes)
             VALUES
                 (:bar_ts, :direction, :confidence, :stop_price, :entry_price,
                  :raw_votes, :safety_ok, :safety_notes)
+            ON CONFLICT(bar_ts) DO UPDATE SET
+                direction    = excluded.direction,
+                confidence   = excluded.confidence,
+                stop_price   = excluded.stop_price,
+                entry_price  = excluded.entry_price,
+                raw_votes    = excluded.raw_votes,
+                safety_ok    = excluded.safety_ok,
+                safety_notes = excluded.safety_notes
+            RETURNING id
         """
-        cur = self._execute(sql, decision)
-        return cur.lastrowid  # type: ignore[return-value]
+        cur = self._conn.execute(sql, decision)
+        row = cur.fetchone()  # read RETURNING before the commit
+        self._conn.commit()
+        return row[0]
 
     def get_decisions_for_day(self, date_str: str) -> list[sqlite3.Row]:
         """Return all decisions on the ET calendar day date_str. bar_ts is stored

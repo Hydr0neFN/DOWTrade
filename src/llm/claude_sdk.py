@@ -83,18 +83,34 @@ def _spent() -> float:
 
 
 def _add(cost_usd: float) -> None:
+    # The ledger is shared with other processes. os.replace() only made the
+    # WRITE atomic; the read-modify-write around it was not, so two writers
+    # could both read N and both store N+x, losing one charge and letting the
+    # monthly cap be overrun. Serialise the whole update on a sidecar lock.
     month = _month()
     try:
-        ledger = json.loads(CREDIT_FILE.read_text())
-    except Exception:
-        ledger = {}
-    ledger[month] = round(float(ledger.get(month, 0.0)) + max(0.0, cost_usd), 6)
-    try:  # atomic write so the concurrent (trader) writer can't read a half file
-        tmp = CREDIT_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(ledger))
-        os.replace(tmp, CREDIT_FILE)
-    except Exception as exc:
-        log.warning("[sdk] credit ledger persist failed: %s", exc)
+        import fcntl
+        lock_fh = open(CREDIT_FILE.with_suffix(".lock"), "a")
+    except Exception as exc:  # non-POSIX dev box, or unwritable dir
+        log.warning("[sdk] credit ledger lock unavailable: %s", exc)
+        fcntl = lock_fh = None
+    try:
+        if lock_fh is not None:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        try:
+            ledger = json.loads(CREDIT_FILE.read_text())
+        except Exception:
+            ledger = {}
+        ledger[month] = round(float(ledger.get(month, 0.0)) + max(0.0, cost_usd), 6)
+        try:  # atomic write so a concurrent reader can't see a half file
+            tmp = CREDIT_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(ledger))
+            os.replace(tmp, CREDIT_FILE)
+        except Exception as exc:
+            log.warning("[sdk] credit ledger persist failed: %s", exc)
+    finally:
+        if lock_fh is not None:
+            lock_fh.close()  # releases the flock
 
 
 def sdk_available() -> bool:

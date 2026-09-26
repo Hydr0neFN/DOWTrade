@@ -427,6 +427,17 @@ class TastytradeBroker(Broker):
         }
         our_status = status_map.get(raw_status, "submitted")
 
+        if our_status == "rejected":
+            # A stop posted for an entry that never opened would rest against
+            # whatever the account holds -- or against nothing, and then open
+            # a reverse position when it triggers.
+            log.warning("[%s] Entry %s (%s); stop leg NOT submitted",
+                        BROKER_NAME, raw_status, tt_symbol)
+            order.status = our_status
+            if broker_order_id:
+                order.order_id = broker_order_id
+            return order
+
         stop_payload = {
             "order-type": "Stop",
             "stop-trigger": str(order.stop_price),

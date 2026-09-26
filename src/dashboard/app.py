@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import sqlite3
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -233,14 +234,24 @@ def _snapshot(db):
     }
 
     pos_cur = db._conn.execute('''
-        SELECT sum(CASE WHEN o.side = 'BUY' THEN f.qty ELSE -f.qty END) as qty,
-               sum(f.price * f.qty) / sum(f.qty) as avg_price
+        SELECT sum(CASE WHEN o.side = 'BUY' THEN f.qty ELSE -f.qty END) as qty
         FROM fills f JOIN orders o ON f.order_id = o.id
     ''').fetchone()
 
     qty = pos_cur["qty"] if pos_cur and pos_cur["qty"] else 0
     side = "LONG" if qty > 0 else ("SHORT" if qty < 0 else "FLAT")
-    avg_price = pos_cur["avg_price"] if pos_cur and pos_cur["avg_price"] else 0.0
+    # Average over the OPEN lots only. Averaging every fill ever (entry and
+    # exit legs of closed round trips alike) drifted away from the real entry
+    # price as soon as any history existed.
+    avg_price = 0.0
+    if qty:
+        try:
+            lots = db._conn.execute(
+                "SELECT sum(avg_price * qty) / sum(qty) AS avg FROM sim_positions"
+            ).fetchone()
+            avg_price = lots["avg"] if lots and lots["avg"] else 0.0
+        except sqlite3.OperationalError:
+            pass  # no sim_positions table (non-sim broker mode)
 
     position = {
         "qty": abs(qty),
