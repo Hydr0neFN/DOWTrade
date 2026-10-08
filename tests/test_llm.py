@@ -37,7 +37,7 @@ RISK_KEYS = {"approved", "violations", "reasoning"}
 
 def _make_haiku_response(data: dict) -> MagicMock:
     msg = MagicMock()
-    msg.content = [MagicMock(text=json.dumps(data))]
+    msg.content = [MagicMock(type="text", text=json.dumps(data))]
     msg.usage.input_tokens = 100
     msg.usage.output_tokens = 50
     msg.usage.cache_read_input_tokens = 0

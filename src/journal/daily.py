@@ -109,9 +109,10 @@ def generate_daily_journal(date_str: str, db: Database, anthropic_client=None) -
         msg = anthropic_client.messages.create(
             model="claude-haiku-5-5",
             max_tokens=1000,
+            thinking={"type": "disabled"},  # 5.5 thinks by default; keep text in content
             messages=[{"role": "user", "content": prompt}]
         )
-        markdown = msg.content[0].text
+        markdown = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
     except Exception as e:
         markdown = f"LLM error: {e}\n\nStats:\nTrades: {trades_taken}\nRealized: {realized_pnl}"
         

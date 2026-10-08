@@ -76,12 +76,15 @@ class HaikuStructural(LLMClient):
         msg = self._client.messages.create(
             model="claude-haiku-5-5",
             max_tokens=400,
+            # Haiku 5.5 thinks by default; the thinking block eats max_tokens and
+            # leaves no text block (content[0].text then raises).
+            thinking={"type": "disabled"},
             system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user}],
             timeout=LLM_TIMEOUT_SEC,
         )
         self._last_model = "claude-haiku-5-5"
-        raw = msg.content[0].text.strip()
+        raw = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
         in_tok = msg.usage.input_tokens + getattr(msg.usage, "cache_read_input_tokens", 0)
         out_tok = msg.usage.output_tokens
         return raw, in_tok, out_tok

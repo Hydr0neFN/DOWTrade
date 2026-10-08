@@ -19,7 +19,7 @@ def test_generate_daily_journal():
     db = Database(path)
     mock_client = MagicMock()
     mock_msg = MagicMock()
-    mock_msg.content = [MagicMock(text="Mocked markdown response")]
+    mock_msg.content = [MagicMock(type="text", text="Mocked markdown response")]
     mock_client.messages.create.return_value = mock_msg
 
     markdown = generate_daily_journal("2026-04-25", db, anthropic_client=mock_client)
