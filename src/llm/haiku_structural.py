@@ -25,7 +25,7 @@ _PROMPT_PATH = Path(__file__).parent / "prompts" / "structural.txt"
 
 class HaikuStructural(LLMClient):
     """
-    Claude Haiku 4.5 structural trend judge.
+    Claude Haiku 5.5 structural trend judge.
 
     Output schema (brief §6.1):
       trend, last_confirmed_hh, last_confirmed_hl, pattern_intact,
@@ -59,7 +59,7 @@ class HaikuStructural(LLMClient):
     ) -> None:
         super().__init__(tracker=tracker, db=db, prompt_path=prompt_path or _PROMPT_PATH)
         self._client = Anthropic(api_key=api_key)
-        self._last_model = "claude-haiku-4-5-20251001"
+        self._last_model = "claude-haiku-5-5"
 
     def _call(self, system: str, user: str) -> Tuple[str, int, int]:
         # Primary: Claude Sonnet via the subscription SDK (the $20 credit), but
@@ -74,13 +74,13 @@ class HaikuStructural(LLMClient):
                             str(exc)[:160])
         # Fallback: metered Anthropic API on Haiku.
         msg = self._client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-haiku-5-5",
             max_tokens=400,
             system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user}],
             timeout=LLM_TIMEOUT_SEC,
         )
-        self._last_model = "claude-haiku-4-5-20251001"
+        self._last_model = "claude-haiku-5-5"
         raw = msg.content[0].text.strip()
         in_tok = msg.usage.input_tokens + getattr(msg.usage, "cache_read_input_tokens", 0)
         out_tok = msg.usage.output_tokens
@@ -90,8 +90,8 @@ class HaikuStructural(LLMClient):
         # Sonnet (subscription SDK path) vs Haiku (API fallback) pricing.
         if getattr(self, "_last_model", "") == "sonnet-sdk":
             return in_tok * 3e-6 + out_tok * 15e-6
-        # Haiku 4.5: $1/M input, $5/M output
-        return in_tok * 1e-6 + out_tok * 5e-6
+        # Haiku 5.5 (prompts <=100k tokens): $0.10/M input, $0.50/M output
+        return in_tok * 0.10e-6 + out_tok * 0.50e-6
 
     def _estimated_cost_usd(self, prompt_chars: int) -> float:
         # Rough estimate: ~4 chars per token, 400 output tokens max

@@ -278,7 +278,7 @@ class TestHaikuStructural:
             client.evaluate_raw("system", "user", bar_ts=12345)
         mock_db.insert_llm_call.assert_called_once()
         call_kwargs = mock_db.insert_llm_call.call_args[0][0]
-        assert call_kwargs["model"] == "claude-haiku-4-5-20251001"
+        assert call_kwargs["model"] == "claude-haiku-5-5"
         assert call_kwargs["error"] is None
 
     def test_api_key_not_in_logs(self, caplog):
