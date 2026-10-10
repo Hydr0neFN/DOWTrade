@@ -150,7 +150,7 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
         _live_tracker = _CostTracker()
         _live_haiku = _HaikuStructural(_settings.anthropic_api_key, _live_tracker, db=db)
         _live_gemini = _GeminiExecution(_settings.google_api_key, _live_tracker, db=db)
-        _live_deepseek = _DeepSeekRisk(_settings.huggingface_api_key, _live_tracker, db=db)
+        _live_deepseek = _DeepSeekRisk(_live_tracker, db=db)
 
     for bar in all_bars:
 

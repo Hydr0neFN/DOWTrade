@@ -72,12 +72,12 @@ def test_gemini_execution_smoke():
 
 @skip_unless_smoke
 def test_deepseek_risk_smoke():
-    """Real call to HuggingFace DeepSeek with a minimal risk audit prompt."""
+    """Real call through the risk-audit chain (NIM, then Cloudflare) with a minimal prompt."""
     from src.llm.deepseek_risk import DeepSeekRisk
     from src.llm.base import CostTracker
 
     tracker = CostTracker(cap_usd=1.0)
-    client = DeepSeekRisk(api_key=settings.huggingface_api_key, tracker=tracker)
+    client = DeepSeekRisk(tracker=tracker)
 
     system = (
         "You are a risk auditor for a futures bot. Output JSON only. "

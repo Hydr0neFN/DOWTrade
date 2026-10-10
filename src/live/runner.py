@@ -19,6 +19,7 @@ from src.live.yfinance_poller import YFinancePoller
 from src.data.bars import BarWindow
 from src.data.features import MarketSnapshot, build_snapshot
 from src.data.cross_filter import CrossFilter
+from src.llm import nim
 from src.llm.base import CostTracker, CostBudgetExceeded, LLMCallResult
 from src.llm.haiku_structural import HaikuStructural
 from src.llm.gemini_execution import GeminiExecution
@@ -83,7 +84,7 @@ class LiveRunner:
         
         self.haiku = HaikuStructural(self.settings.anthropic_api_key, self.tracker, db=self.db)
         self.gemini = GeminiExecution(self.settings.google_api_key, self.tracker, db=self.db)
-        self.deepseek = DeepSeekRisk(self.settings.huggingface_api_key, self.tracker, db=self.db)
+        self.deepseek = DeepSeekRisk(self.tracker, db=self.db)
         
         self.window = BarWindow(maxlen=500)
         self.streamer: Optional[DxLinkStreamer] = None
@@ -331,6 +332,8 @@ class LiveRunner:
         # doubling MAX_DAILY_LOSS_USD for the day.
         day_str = datetime.now(ET).strftime("%Y-%m-%d")
         if self._last_day != day_str:
+            if self._last_day is not None:
+                log.info(nim.summary_and_reset())
             self._budget_exceeded = False
             self._last_day = day_str
             self._realized_pnl_today = 0.0

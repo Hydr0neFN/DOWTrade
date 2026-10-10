@@ -6,6 +6,7 @@ Replaces StubHaiku from Phase 2.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -15,12 +16,19 @@ from anthropic import Anthropic
 
 from src.config import LLM_TIMEOUT_SEC
 from src.data.features import MarketSnapshot
-from src.llm.base import LLMCallResult, LLMClient, CostTracker, render_prompt
+from src.llm import nim
+from src.llm.base import LLMCallResult, LLMClient, CostTracker, parse_json_strict, render_prompt
 from src.llm.claude_sdk import sdk_available, sdk_complete, scope_allows
 
 log = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "structural.txt"
+
+# Shadow-only NIM model. No NIM model matched the production structural output
+# in /root/nim-bench (signal agreement at best 3/8), so the decision stays on
+# Claude; gpt-oss-20b runs alongside purely so the two can be compared later.
+SHADOW_SPEC = nim.NimSpec(nim.GPT_OSS_20B, 15.0)
+SHADOW_LABEL = f"nim-shadow:{nim.GPT_OSS_20B}"
 
 
 class HaikuStructural(LLMClient):
@@ -131,4 +139,32 @@ class HaikuStructural(LLMClient):
             atr14=snapshot.atr14,
             current_price=snapshot.current_price,
         )
-        return self.evaluate_raw(system, user, bar_ts=bar_ts)
+        result = self.evaluate_raw(system, user, bar_ts=bar_ts)
+        self._run_shadow(system, user, bar_ts)
+        return result
+
+    def _run_shadow(self, system: str, user: str, bar_ts: int) -> None:
+        """Log what NIM gpt-oss-20b would have said about this bar. Observation
+        only: the result is never returned or used, it runs after the production
+        call, it is bounded by SHADOW_SPEC.timeout, it is skipped when the shared
+        NIM guard says NIM is unavailable, and nothing it does can raise."""
+        try:
+            client = nim.get_client()
+            if client is None or self._db is None:
+                return
+            res = client.complete(SHADOW_SPEC, system, user, self.schema_keys)
+            if res.skipped:
+                return
+            parsed = parse_json_strict(res.raw) if res.ok else None
+            self._db.insert_llm_call({
+                "bar_ts": str(bar_ts),
+                "model": SHADOW_LABEL,
+                "prompt_hash": hashlib.sha256((system + user).encode()).hexdigest()[:16],
+                "raw_response": res.raw[:2000],
+                "parsed_json": json.dumps(parsed) if parsed is not None else None,
+                "latency_ms": res.latency_ms,
+                "cost_usd": 0.0,
+                "error": res.error,
+            })
+        except Exception as exc:
+            log.warning("[haiku] NIM shadow call failed (%s)", str(exc)[:120])

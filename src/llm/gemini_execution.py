@@ -1,8 +1,12 @@
 """
 src/llm/gemini_execution.py
 ============================
-Gemini execution judge with model fallback chain.
-Replaces StubGemini from Phase 2.
+Execution judge. Provider chain (first valid answer wins):
+
+  1. NVIDIA NIM  z-ai/glm-5.3-flash          (40 s)
+  2. NVIDIA NIM  nvidia/nemotron-3-super     (8 s)
+  3. Gemini free API, GEMINI_MODELS in order (unchanged; optional gemini-cli first)
+  4. Cloudflare  mistral-small-3.1-24b       (last resort, free plan)
 """
 from __future__ import annotations
 
@@ -19,11 +23,25 @@ from google.genai import types as genai_types
 from src.broker.models import Position
 from src.config import LLM_TIMEOUT_SEC
 from src.data.features import MarketSnapshot
+from src.llm import nim
 from src.llm.base import LLMCallResult, LLMClient, CostTracker, render_prompt
+from src.llm.cf import cf_chat, make_cf_client
 
 log = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "execution.txt"
+
+# NIM models, from the /root/nim-bench benchmark: glm-5.3-flash agreed with the
+# production Gemini action on 8/8 bars (slow, p50 ~14 s, hence the long timeout);
+# nemotron-3-super with thinking off agreed on 7/8 in ~1 s, so it is a cheap
+# second chance with a short timeout.
+NIM_CHAIN = (
+    nim.NimSpec(nim.GLM_FLASH, 40.0),
+    nim.NimSpec(nim.NEMOTRON_SUPER, 8.0),
+)
+
+# Last resort after every Gemini model has failed.
+CF_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
 
 # Chain refreshed 2026-08-30 against the live free-tier model list.
 # gemini-3.7-flash was dropped on 2026-10-10 because Google deprecated it.
@@ -83,6 +101,7 @@ class GeminiExecution(LLMClient):
         super().__init__(tracker=tracker, db=db, prompt_path=prompt_path or _PROMPT_PATH)
         self._client = genai.Client(api_key=api_key)
         self._last_model = GEMINI_MODELS[-1]  # default to final fallback
+        self._cf_client = make_cf_client("gemini")
 
     def _call_via_cli(self, system: str, user: str) -> Tuple[str, int, int]:
         """Call the local gemini CLI, walking the CLI fallback chain.
@@ -124,6 +143,27 @@ class GeminiExecution(LLMClient):
         raise RuntimeError(f"All CLI models failed: {last_exc}")
 
     def _call(self, system: str, user: str) -> Tuple[str, int, int]:
+        """NIM chain, then Gemini, then Cloudflare as the last resort."""
+        res = nim.run_chain(NIM_CHAIN, system, user, self.schema_keys)
+        if res is not None:
+            self._last_model = f"nim:{res.model}"
+            return res.raw, res.in_tok, res.out_tok
+        try:
+            return self._call_gemini(system, user)
+        except Exception as gemini_exc:
+            if self._cf_client is None:
+                raise
+            try:
+                raw, in_tok, out_tok = cf_chat(self._cf_client, CF_MODEL, system, user)
+            except Exception as cf_exc:
+                log.warning("[gemini] Cloudflare last resort %s failed (%s)", CF_MODEL, str(cf_exc)[:80])
+                raise gemini_exc
+            log.warning("[gemini] all Gemini models failed (%s) -- answered by %s",
+                        str(gemini_exc)[:80], CF_MODEL)
+            self._last_model = CF_MODEL
+            return raw, in_tok, out_tok
+
+    def _call_gemini(self, system: str, user: str) -> Tuple[str, int, int]:
         """CLI primary (Pro plan, 3.1 Pro), falling back through GEMINI_MODELS via API."""
         # Primary: gemini-cli on Pro plan
         if USE_GEMINI_CLI:
@@ -154,13 +194,19 @@ class GeminiExecution(LLMClient):
         raise RuntimeError(f"All Gemini models failed: {last_exc}")
 
     def _actual_cost_usd(self, in_tok: int, out_tok: int) -> float:
+        # NIM free tier and Cloudflare's free allowance cost nothing; billing them
+        # at the Gemini placeholder would walk the shared CostTracker toward
+        # MAX_LLM_SPEND_USD over spend that never happened.
+        if self._last_model.startswith(("nim:", "@cf/")):
+            return 0.0
         # Gemini 2.5 Flash pricing placeholder: $0.075/M input, $0.30/M output
         return in_tok * 0.075e-6 + out_tok * 0.30e-6
 
     def _estimated_cost_usd(self, prompt_chars: int) -> float:
         est_in = prompt_chars / 4
         est_out = 300
-        return self._actual_cost_usd(int(est_in), est_out)
+        # Worst case (Gemini billing), regardless of which provider answered last.
+        return int(est_in) * 0.075e-6 + est_out * 0.30e-6
 
     def evaluate(
         self,

@@ -409,36 +409,51 @@ RISK_VIOLATION = {
 }
 
 
-from src.llm.deepseek_risk import CF_MODELS, HF_MODEL
+from src.llm.deepseek_risk import CF_MODELS
+
+
+def _empty_cf_response() -> MagicMock:
+    empty = MagicMock()
+    empty.choices = [MagicMock(message=MagicMock(content=""))]
+    empty.usage = MagicMock(prompt_tokens=10, completion_tokens=0)
+    return empty
 
 
 class TestDeepSeekRisk:
-    def _make_client(self, tracker=None):
+    """Risk auditor with NIM disabled (conftest): the Cloudflare tail of the chain.
+
+    The NIM head of the chain and the NIM -> Cloudflare hand-off are covered in
+    tests/test_nim.py.
+    """
+
+    def _make_client(self, tracker=None, cf=True):
         from src.llm.deepseek_risk import DeepSeekRisk
-        return DeepSeekRisk(api_key="test-key-redacted", tracker=tracker)
+        client = DeepSeekRisk(tracker=tracker)
+        assert client._cf_client is None, "test env must not carry CF credentials"
+        if cf:
+            client._cf_client = MagicMock()
+        return client
 
     def test_happy_path_approved(self):
         client = self._make_client()
-        with patch.object(client._client, "chat_completion",
-                          return_value=_make_hf_response(RISK_GOOD)):
-            result = client.evaluate_raw("system", "user", bar_ts=12345)
+        client._cf_client.chat_completion = MagicMock(return_value=_make_hf_response(RISK_GOOD))
+        result = client.evaluate_raw("system", "user", bar_ts=12345)
         assert result.error is None
         assert result.parsed["approved"] is True
         assert result.used_fallback is False
+        assert result.model_used == CF_MODELS[0]
 
     def test_violation_parsed_correctly(self):
         client = self._make_client()
-        with patch.object(client._client, "chat_completion",
-                          return_value=_make_hf_response(RISK_VIOLATION)):
-            result = client.evaluate_raw("system", "user", bar_ts=12345)
+        client._cf_client.chat_completion = MagicMock(return_value=_make_hf_response(RISK_VIOLATION))
+        result = client.evaluate_raw("system", "user", bar_ts=12345)
         assert result.parsed["approved"] is False
         assert "AVERAGING_DOWN" in result.parsed["violations"]
 
     def test_timeout_returns_safe_default(self):
         client = self._make_client()
-        with patch.object(client._client, "chat_completion",
-                          side_effect=Exception("connection timeout")):
-            result = client.evaluate_raw("system", "user", bar_ts=12345)
+        client._cf_client.chat_completion = MagicMock(side_effect=Exception("connection timeout"))
+        result = client.evaluate_raw("system", "user", bar_ts=12345)
         assert result.used_fallback is True
         assert result.parsed["approved"] is False
         assert "llm_unavailable" in result.parsed["violations"]
@@ -448,35 +463,23 @@ class TestDeepSeekRisk:
         bad_resp = MagicMock()
         bad_resp.choices = [MagicMock(message=MagicMock(content="not json"))]
         bad_resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-        with patch.object(client._client, "chat_completion", return_value=bad_resp):
-            result = client.evaluate_raw("system", "user", bar_ts=12345)
+        client._cf_client.chat_completion = MagicMock(return_value=bad_resp)
+        result = client.evaluate_raw("system", "user", bar_ts=12345)
         assert result.used_fallback is True
 
-    def test_budget_exceeded_no_sdk_call(self):
+    def test_budget_exceeded_no_provider_call(self):
         tracker = CostTracker(cap_usd=0.0)
+        tracker.record(1.0)  # over the cap: the audit is free, but the cap still halts LLM calls
         client = self._make_client(tracker=tracker)
-        with patch.object(client._client, "chat_completion") as mock_cc:
-            result = client.evaluate_raw("system", "user", bar_ts=12345)
-            mock_cc.assert_not_called()
+        client._cf_client.chat_completion = MagicMock()
+        result = client.evaluate_raw("system", "user", bar_ts=12345)
+        client._cf_client.chat_completion.assert_not_called()
         assert result.error == "budget_exceeded"
 
-    def test_fallback_chain_crosses_providers(self):
-        """HF primary fails, both Cloudflare models are tried, the second answers.
-
-        The chain used to be four HuggingFace models on one client, so this test
-        could count calls on a single mock. It is now HF -> Cloudflare, and the
-        point of that split is precisely that the second provider is reachable
-        when the first one is not -- so the test has to span both clients or it
-        is not testing the property that matters.
-        """
+    def test_cloudflare_order_llama_before_mistral(self):
+        """llama-4-scout first (more accurate in the benchmark), mistral second."""
         client = self._make_client()
-        client._cf_client = MagicMock()
-
-        hf_calls, cf_calls = [], []
-
-        def hf_side_effect(*args, **kwargs):
-            hf_calls.append(kwargs.get("model"))
-            raise Exception("402 Payment Required")
+        cf_calls = []
 
         def cf_side_effect(*args, **kwargs):
             cf_calls.append(kwargs.get("model"))
@@ -484,24 +487,26 @@ class TestDeepSeekRisk:
                 raise Exception("503 service unavailable")
             return _make_hf_response(RISK_GOOD)
 
-        with patch.object(client._client, "chat_completion", side_effect=hf_side_effect):
-            client._cf_client.chat_completion = MagicMock(side_effect=cf_side_effect)
-            result = client.evaluate_raw("system", "user", bar_ts=12345)
+        client._cf_client.chat_completion = MagicMock(side_effect=cf_side_effect)
+        result = client.evaluate_raw("system", "user", bar_ts=12345)
 
-        assert hf_calls == [HF_MODEL]
         assert cf_calls == CF_MODELS
+        assert CF_MODELS[0].startswith("@cf/meta/llama-4-scout")
+        assert CF_MODELS[1].startswith("@cf/mistralai/mistral-small")
         assert result.parsed["approved"] is True
         assert client._last_model == CF_MODELS[1]
 
-    def test_cloudflare_leg_skipped_without_credentials(self):
-        """No CF credentials must degrade to HF-only, not raise."""
-        client = self._make_client()
-        assert client._cf_client is None, "test env must not carry CF credentials"
+    def test_no_huggingface_leg(self):
+        """The HF DeepSeek leg is gone (account has no credit, 402 on every call)."""
+        import src.llm.deepseek_risk as dr
+        assert not hasattr(dr, "HF_MODEL")
+        client = self._make_client(cf=False)
+        assert not hasattr(client, "_client")
 
-        with patch.object(client._client, "chat_completion",
-                          side_effect=Exception("402 Payment Required")):
-            result = client.evaluate_raw("system", "user", bar_ts=12345)
-
+    def test_no_providers_returns_safe_default(self):
+        """No CF credentials and no NIM: nothing to call, safe default, no raise."""
+        client = self._make_client(cf=False)
+        result = client.evaluate_raw("system", "user", bar_ts=12345)
         assert result.used_fallback is True
         assert "llm_unavailable" in result.parsed["violations"]
 
@@ -513,56 +518,45 @@ class TestDeepSeekRisk:
         so it must fall through to the next one rather than consume the attempt.
         """
         client = self._make_client()
-        client._cf_client = MagicMock()
-
-        empty = MagicMock()
-        empty.choices = [MagicMock(message=MagicMock(content=""))]
-        empty.usage = MagicMock(prompt_tokens=10, completion_tokens=0)
-
         cf_models = []
 
         def cf_side_effect(*args, **kwargs):
             cf_models.append(kwargs.get("model"))
-            return _make_hf_response(RISK_GOOD) if len(cf_models) == 2 else empty
+            return _make_hf_response(RISK_GOOD) if len(cf_models) == 2 else _empty_cf_response()
 
-        with patch.object(client._client, "chat_completion", return_value=empty):
-            client._cf_client.chat_completion = MagicMock(side_effect=cf_side_effect)
-            result = client.evaluate_raw("system", "user", bar_ts=12345)
+        client._cf_client.chat_completion = MagicMock(side_effect=cf_side_effect)
+        result = client.evaluate_raw("system", "user", bar_ts=12345)
 
         assert cf_models == CF_MODELS
         assert result.parsed["approved"] is True
         assert client._last_model == CF_MODELS[1]
 
-    def test_cloudflare_calls_are_free(self):
-        """A free-tier call must not be billed the HuggingFace placeholder.
-
-        _actual_cost_usd() returns a flat $0.001 stand-in, which is fine for the
-        metered HF endpoint but walks the shared CostTracker toward
-        MAX_LLM_SPEND_USD on Cloudflare spend that never happens -- and hitting
-        that cap stops the risk audit outright.
-        """
+    def test_all_calls_are_free(self):
+        """Neither NIM nor Cloudflare is billed: a placeholder cost would walk the
+        shared CostTracker toward MAX_LLM_SPEND_USD over spend that never happens
+        and eventually stop the risk audit outright."""
         client = self._make_client()
-        client._last_model = CF_MODELS[0]
-        assert client._actual_cost_usd(1000, 1000) == 0.0
-        client._last_model = HF_MODEL
-        assert client._actual_cost_usd(1000, 1000) > 0.0
+        for label in (CF_MODELS[0], "nim:openai/gpt-oss-20b"):
+            client._last_model = label
+            assert client._actual_cost_usd(1000, 1000) == 0.0
+        assert client._estimated_cost_usd(10_000) == 0.0
 
     def test_db_persistence(self):
         client = self._make_client()
         mock_db = MagicMock()
         client._db = mock_db
-        with patch.object(client._client, "chat_completion",
-                          return_value=_make_hf_response(RISK_GOOD)):
-            client.evaluate_raw("system", "user", bar_ts=12345)
+        client._cf_client.chat_completion = MagicMock(return_value=_make_hf_response(RISK_GOOD))
+        client.evaluate_raw("system", "user", bar_ts=12345)
         mock_db.insert_llm_call.assert_called_once()
+        assert mock_db.insert_llm_call.call_args[0][0]["model"] == CF_MODELS[0]
 
     def test_api_key_not_in_logs(self, caplog):
         client = self._make_client()
         bad_resp = MagicMock()
         bad_resp.choices = [MagicMock(message=MagicMock(content="bad json"))]
         bad_resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+        client._cf_client.chat_completion = MagicMock(return_value=bad_resp)
         with caplog.at_level(logging.WARNING):
-            with patch.object(client._client, "chat_completion", return_value=bad_resp):
-                client.evaluate_raw("system", "user", bar_ts=12345)
+            client.evaluate_raw("system", "user", bar_ts=12345)
         for record in caplog.records:
             assert "test-key-redacted" not in record.message

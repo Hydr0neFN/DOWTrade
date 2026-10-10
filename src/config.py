@@ -106,7 +106,6 @@ class Settings(BaseSettings):
     # LLM API keys
     anthropic_api_key: str = Field(default="")
     google_api_key: str = Field(default="")
-    huggingface_api_key: str = Field(default="")
 
     # Storage / logs
     db_path: str = Field(default="./data/bot.db")
