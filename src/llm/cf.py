@@ -22,6 +22,10 @@ log = logging.getLogger(__name__)
 CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
 
+# Total per-request timeout (seconds) handed to huggingface_hub's InferenceClient.
+# Without it a stalled Workers AI call has no bound at all.
+CF_TIMEOUT_SEC = 30.0
+
 
 def make_cf_client(owner: str) -> Optional[InferenceClient]:
     """A Workers AI client, or None (with a warning naming `owner`) if unconfigured."""
@@ -29,6 +33,7 @@ def make_cf_client(owner: str) -> Optional[InferenceClient]:
         return InferenceClient(
             base_url=f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1",
             token=CF_API_TOKEN,
+            timeout=CF_TIMEOUT_SEC,
         )
     log.warning("[%s] Cloudflare fallback disabled "
                 "(CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN unset)", owner)

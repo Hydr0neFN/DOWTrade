@@ -9,9 +9,12 @@ sleeps. tests/conftest.py disables NIM for every other test.
 """
 from __future__ import annotations
 
+import gzip
+import http.server
 import json
 import logging
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -407,7 +410,7 @@ class TestRequestAndResponse:
         assert client.guard.acquire(GPT) is None
 
     def test_no_retries(self):
-        client, post, clock = install({GPT: [status(503), ok(RISK_GOOD)]})
+        client, post, clock = install({GPT: [status(502), ok(RISK_GOOD)]})
         assert client.complete(SPEC, "s", "u").error == "5xx"
         assert len(post.calls) == 1
 
@@ -438,9 +441,10 @@ class TestStats:
         client.complete(SPEC, "s", "u")
         client.complete(SPEC, "s", "u")  # cooldown
         s = client.guard.stats()
-        assert s["calls"] == 3 and s["skipped_cooldown"] == 1
+        assert s["calls"] == 3 and s["skipped_cooldown"] == 1 and s["shadow_skipped"] == 0
         assert s["failures"] == {"timeout": 1, "429": 1}
         assert "calls=3" in client.guard.summary_line() and "timeout=1" in client.guard.summary_line()
+        assert "shadow_skipped=0" in client.guard.summary_line()
         nim.GUARD.reset_stats()  # module-level helper zeroes the shared guard
         assert nim.summary_and_reset().startswith("NIM stats: calls=0")
 
@@ -664,8 +668,30 @@ class TestExecutionChain:
             assert c._actual_cost_usd(1000, 1000) == 0.0
         c._last_model = "gemini-3.6-flash"
         assert c._actual_cost_usd(1000, 1000) > 0.0
-        c._last_model = "nim:z-ai/glm-5.3-flash"
-        assert c._estimated_cost_usd(4000) > 0.0  # the pre-call budget check stays conservative
+        # The pre-call budget check must not hold back a chain that starts free.
+        for label in ("nim:z-ai/glm-5.3-flash", "gemini-3.6-flash"):
+            c._last_model = label
+            assert c._estimated_cost_usd(4000) == 0.0
+        assert c._estimated_cost_usd(10_000_000) == 0.0
+
+    def test_exhausted_budget_does_not_block_the_free_chain(self):
+        """cap 0 and nothing spent: the NIM call still goes out (estimate is 0)."""
+        _, post, _ = install({GLM: [ok(EXEC_GOOD)]})
+        c = self._client(CostTracker(cap_usd=0.0))
+        r = c.evaluate_raw("s", "u", bar_ts=7)
+        assert r.error is None and r.model_used == "nim:" + GLM and r.cost_usd == 0.0
+        assert len(post.calls) == 1
+
+    def test_budget_already_overspent_still_blocks(self):
+        _, post, _ = install({GLM: [ok(EXEC_GOOD)]})
+        tracker = CostTracker(cap_usd=0.0)
+        tracker.record(0.01)
+        r = self._client(tracker).evaluate_raw("s", "u", bar_ts=7)
+        assert r.error == "budget_exceeded" and post.calls == []
+
+    def test_risk_leg_estimate_is_already_zero(self):
+        from src.llm.deepseek_risk import DeepSeekRisk
+        assert DeepSeekRisk()._estimated_cost_usd(10_000_000) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +806,8 @@ class TestStructuralShadow:
         assert r.parsed == STRUCT_GOOD
         assert post.calls == []
         assert [row["model"] for row in c._db.rows] == ["claude-haiku-5-5"]
+        if how != "disabled":
+            assert client.guard.stats()["shadow_skipped"] == 1
 
     def test_production_failure_still_returns_safe_default_and_shadow_still_logs(self):
         """The shadow is independent of the production outcome."""
@@ -798,13 +826,559 @@ class TestStructuralShadow:
         r = self._run(c)
         assert r.parsed == STRUCT_GOOD and post.calls == []
 
-    def test_shadow_shares_the_rate_limit(self):
+    def test_shadow_shares_the_rate_limit_but_leaves_ten_slots_free(self):
         client, post, clock = install({GPT: [ok(STRUCT_SHADOW)]})
-        for _ in range(29):
+        for _ in range(19):
             assert client.guard.acquire(GPT) is None
         c = self._client()
         self._run(c)
-        assert len(post.calls) == 1            # 30th slot
+        assert len(post.calls) == 1            # 19 used -> admitted (20th slot)
         self._run(c)
-        assert len(post.calls) == 1            # window full: second shadow skipped
-        assert client.guard.stats()["skipped_ratelimit"] == 1
+        assert len(post.calls) == 2            # exactly 20 used = 10 free -> still admitted
+        self._run(c)
+        assert len(post.calls) == 2            # 21 used: the shadow stands down
+        s = client.guard.stats()
+        assert s["shadow_skipped"] == 1 and s["skipped_ratelimit"] == 0
+        for _ in range(9):                     # and real calls still get the remaining 9 slots
+            assert client.guard.acquire(GPT) is None
+        assert client.guard.acquire(GPT) == "ratelimit"
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: hard wall-clock deadline
+# ---------------------------------------------------------------------------
+
+class _Server:
+    """Local HTTP server with a scripted misbehaviour. `delay` is the pause
+    between single bytes (headers trickle or body trickle); 0 = reply at once."""
+
+    BODY = json.dumps({"choices": [{"message": {"content": json.dumps(RISK_GOOD)}}],
+                       "usage": {"prompt_tokens": 7, "completion_tokens": 3}}).encode()
+
+    def __init__(self, mode: str = "ok", delay: float = 0.0) -> None:
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                try:
+                    outer.respond(self)
+                except OSError:
+                    pass                      # client gave up: expected
+
+        self.mode, self.delay = mode, delay
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/v1/chat/completions"
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+
+    def respond(self, h) -> None:
+        body = self.BODY
+        if self.mode == "gzip":
+            body = gzip.compress(body)
+        head = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + (b"Content-Encoding: gzip\r\n" if self.mode == "gzip" else b"")
+                + b"Content-Length: %d\r\n\r\n" % len(body))
+        if self.mode == "trickle_headers":
+            for b in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 40:
+                h.wfile.write(bytes([b])); h.wfile.flush(); time.sleep(self.delay)
+            h.wfile.write(b"\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        elif self.mode == "trickle_body":
+            h.wfile.write(head); h.wfile.flush()
+            for b in body:
+                h.wfile.write(bytes([b])); h.wfile.flush(); time.sleep(self.delay)
+        else:
+            h.wfile.write(head + body); h.wfile.flush()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+@pytest.fixture
+def server():
+    made = []
+
+    def make(mode="ok", delay=0.0):
+        srv = _Server(mode, delay)
+        made.append(srv)
+        return srv
+
+    yield make
+    for srv in made:
+        srv.close()
+
+
+def _real_client(monkeypatch, srv) -> NimClient:
+    """A client on the real _http_post, pointed at the local server."""
+    monkeypatch.setattr(nim, "NIM_URL", srv.url)
+    client = NimClient(KEY, guard=NimGuard())
+    nim.set_client(client)
+    return client
+
+
+class TestHardDeadline:
+    @pytest.mark.parametrize("mode", ["trickle_body", "trickle_headers"])
+    def test_slow_trickle_is_cut_off_at_the_deadline(self, monkeypatch, server, mode):
+        """Every byte arrives well inside httpx's per-read timeout, so only a real
+        total deadline stops this (it ran 76 s against a 2 s spec before)."""
+        client = _real_client(monkeypatch, server(mode, delay=0.2))
+        t0 = time.monotonic()
+        res = client.complete(NimSpec(GPT, 0.5), "s", "u")
+        wall = time.monotonic() - t0
+        assert res.error == "timeout" and not res.ok
+        assert 0.45 <= wall <= 0.5 + 0.5, wall
+        assert client.guard.stats()["failures"] == {"timeout": 1}
+
+    def test_deadline_counts_as_timeout_for_the_breaker(self, monkeypatch, server):
+        client = _real_client(monkeypatch, server("trickle_body", delay=0.2))
+        spec = NimSpec(GPT, 0.25)
+        assert client.complete(spec, "s", "u").error == "timeout"
+        assert client.complete(spec, "s", "u").error == "timeout"
+        assert client.complete(spec, "s", "u").skipped == "breaker"
+
+    def test_hung_connect_or_dns_is_bounded_by_the_caller_side_deadline(self, monkeypatch):
+        """If the worker never comes back (DNS / connect hanging) the caller still
+        returns at the deadline."""
+        client = NimClient(KEY, guard=NimGuard())
+        release = threading.Event()
+        monkeypatch.setattr(client, "_send", lambda *a: release.wait(5))
+        try:
+            t0 = time.monotonic()
+            res = client.complete(NimSpec(GPT, 0.4), "s", "u")
+            wall = time.monotonic() - t0
+        finally:
+            release.set()
+        assert res.error == "timeout" and 0.35 <= wall <= 0.9, wall
+
+    def test_pool_is_capped_and_queued_requests_still_hit_their_deadline(self, monkeypatch):
+        client = NimClient(KEY, guard=NimGuard())
+        release = threading.Event()
+        monkeypatch.setattr(client, "_send", lambda *a: release.wait(5))
+        results, n = [], nim.HTTP_WORKERS + 3
+        try:
+            def one():
+                t0 = time.monotonic()
+                results.append((client.complete(NimSpec(GPT, 0.4), "s", "u").error,
+                                time.monotonic() - t0))
+            threads = [threading.Thread(target=one) for _ in range(n)]
+            for t in threads: t.start()
+            for t in threads: t.join(3)
+            workers = [t for t in threading.enumerate() if t.name.startswith("nim-http")]
+        finally:
+            release.set()
+        assert len(results) == n and all(e == "timeout" and w <= 0.9 for e, w in results), results
+        assert len(workers) <= nim.HTTP_WORKERS
+
+    def test_fast_response_and_gzip_still_work(self, monkeypatch, server):
+        for mode in ("ok", "gzip"):
+            client = _real_client(monkeypatch, server(mode))
+            res = client.complete(NimSpec(GPT, 2.0), "s", "u", RISK_KEYS)
+            assert res.ok and (res.in_tok, res.out_tok) == (7, 3), (mode, res)
+            assert json.loads(res.raw)["approved"] is True
+
+    def test_connection_refused_is_a_connection_failure(self, monkeypatch):
+        monkeypatch.setattr(nim, "NIM_URL", "http://127.0.0.1:1/")
+        client = NimClient(KEY, guard=NimGuard())
+        assert client.complete(NimSpec(GPT, 2.0), "s", "u").error == "connection"
+
+    def test_shadow_keeps_its_15s_deadline(self):
+        from src.llm.haiku_structural import SHADOW_SPEC
+        assert SHADOW_SPEC.timeout == 15.0
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: complete() / run_chain() never raise
+# ---------------------------------------------------------------------------
+
+class TestNeverRaises:
+    @pytest.mark.parametrize("usage,expected", [
+        ([1, 2], (0, 0)),
+        ("lots", (0, 0)),
+        (None, (0, 0)),
+        ({"prompt_tokens": "n/a"}, (0, 0)),
+        ({"prompt_tokens": None, "completion_tokens": [3]}, (0, 0)),
+        ({"prompt_tokens": {"x": 1}, "completion_tokens": True}, (0, 0)),
+        ({"prompt_tokens": float("nan"), "completion_tokens": float("inf")}, (0, 0)),
+        ({"prompt_tokens": -5, "completion_tokens": 2.9}, (0, 2)),
+        ({"prompt_tokens": 12, "completion_tokens": 4}, (12, 4)),
+    ])
+    def test_malformed_usage_is_tolerated(self, usage, expected):
+        payload = {"choices": [{"message": {"content": json.dumps(RISK_GOOD)}}], "usage": usage}
+        resp = httpx.Response(200, content=json.dumps(payload).encode())   # allows NaN / Infinity
+        client, post, clock = install({GPT: [resp]})
+        res = client.complete(SPEC, "s", "u", RISK_KEYS)
+        assert res.ok, res
+        assert (res.in_tok, res.out_tok) == expected
+
+    @pytest.mark.parametrize("content", ["[1, 2, 3]", "42", "\"text\"", "null", "true"])
+    def test_non_object_json_is_a_failure_not_an_exception(self, content):
+        client, post, clock = install({GPT: [ok(content)]})
+        res = client.complete(SPEC, "s", "u", RISK_KEYS)
+        assert not res.ok and res.error in ("parse", "schema")
+
+    def test_parsed_non_object_is_a_schema_failure(self, monkeypatch):
+        monkeypatch.setattr(nim, "parse_json_strict", lambda raw: [1, 2])
+        client, post, clock = install({GPT: [ok(RISK_GOOD)]})
+        res = client.complete(SPEC, "s", "u", RISK_KEYS)
+        assert res.error == "schema" and not res.ok
+        assert client.guard.stats()["failures"] == {"schema": 1}
+        monkeypatch.setattr(nim, "parse_json_strict", lambda raw: "x")
+        assert client.complete(SPEC, "s", "u").error == "schema"   # even with no required keys
+
+    def test_anything_inside_complete_is_contained(self):
+        client, post, clock = install({GPT: [ok(RISK_GOOD)]})
+        with patch.object(client.guard, "acquire", side_effect=RuntimeError("guard exploded")):
+            res = client.complete(SPEC, "s", "u")
+        assert res.error == "error" and not res.ok
+        resp = MagicMock(status_code=200)
+        resp.json.side_effect = RuntimeError("boom")
+        client._post = lambda *a: resp
+        assert client.complete(SPEC, "s", "u").error == "parse"
+
+    def test_run_chain_never_raises_and_logs_one_warning(self, caplog):
+        client, post, clock = install({GPT: [ok(RISK_GOOD)]})
+        with patch.object(client, "complete", side_effect=RuntimeError("kaboom")), \
+                caplog.at_level(logging.WARNING, logger="src.llm.nim"):
+            assert nim.run_chain((SPEC, NimSpec(GLM, 25)), "s", "u", RISK_KEYS) is None
+        warn = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warn) == 1 and "kaboom" in warn[0].getMessage()
+        with patch.object(nim, "get_client", side_effect=ValueError("no")):
+            assert nim.run_chain((SPEC,), "s", "u") is None
+
+    def test_risk_leg_falls_through_to_cloudflare_when_nim_blows_up(self):
+        from src.llm.deepseek_risk import CF_MODELS, DeepSeekRisk
+        client, post, clock = install({GPT: [ok(RISK_GOOD)]})
+        c = DeepSeekRisk()
+        c._cf_client = MagicMock()
+        c._cf_client.chat_completion = MagicMock(return_value=_cf_resp(RISK_GOOD))
+        with patch.object(client, "complete", side_effect=RuntimeError("kaboom")):
+            r = c.evaluate_raw("s", "u", bar_ts=1)
+        assert r.error is None and r.model_used == CF_MODELS[0]
+
+    def test_execution_leg_falls_through_to_gemini_with_malformed_usage(self):
+        from src.llm.gemini_execution import GeminiExecution
+        resp = httpx.Response(200, json={
+            "choices": [{"message": {"content": json.dumps(EXEC_GOOD)}}], "usage": [1, 2]})
+        install({GLM: [resp]})
+        c = GeminiExecution(api_key="test-key-redacted", tracker=CostTracker())
+        c._cf_client = None
+        r = c.evaluate_raw("s", "u", bar_ts=1)
+        assert r.error is None and r.model_used == "nim:" + GLM and r.input_tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: key file loading
+# ---------------------------------------------------------------------------
+
+class TestKeyFileFailures:
+    def _reset(self, monkeypatch, path):
+        monkeypatch.delenv(nim.KEY_ENV, raising=False)
+        monkeypatch.setattr(nim, "KEY_FILE", path)
+        nim.reset()
+
+    def test_non_utf8_key_file_disables_nim_once(self, monkeypatch, tmp_path, caplog):
+        f = tmp_path / "key"
+        f.write_bytes(b"\xff\xfe\x00bad")
+        self._reset(monkeypatch, f)
+        with caplog.at_level(logging.INFO, logger="src.llm.nim"):
+            assert nim.get_client() is None
+            for _ in range(5):
+                assert nim.get_client() is None
+                assert nim.run_chain((SPEC,), "s", "u") is None
+        msgs = [r.getMessage() for r in caplog.records]
+        assert sum("cannot read" in m for m in msgs) == 1, msgs
+        assert sum("disabled" in m for m in msgs) == 2     # the read warning + the one "disabled" line
+
+    def test_file_is_never_re_read_after_a_failure(self, monkeypatch, tmp_path):
+        reads = []
+
+        class BadFile:
+            def read_text(self):
+                reads.append(1)
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+            def __str__(self):
+                return "/bad/key"
+
+        monkeypatch.delenv(nim.KEY_ENV, raising=False)
+        monkeypatch.setattr(nim, "KEY_FILE", BadFile())
+        nim.reset()
+        for _ in range(10):
+            assert nim.get_client() is None
+        assert len(reads) == 1
+
+    def test_unreadable_key_file_is_disabled_not_fatal(self, monkeypatch, tmp_path):
+        self._reset(monkeypatch, tmp_path)               # a directory: IsADirectoryError
+        assert nim.get_client() is None
+
+    @pytest.mark.parametrize("key", ["nvapi-k\u00e9y", "nvapi key", "nvapi\x00key"])
+    def test_key_that_could_not_be_sent_in_a_header_disables_nim(self, monkeypatch, tmp_path, key):
+        f = tmp_path / "key"
+        f.write_text(key, encoding="utf-8")
+        self._reset(monkeypatch, f)
+        assert nim.get_client() is None
+
+    def test_legs_still_work_with_a_bad_key_file(self, monkeypatch, tmp_path):
+        from src.llm.deepseek_risk import CF_MODELS, DeepSeekRisk
+        f = tmp_path / "key"
+        f.write_bytes(b"\xff\xfe")
+        self._reset(monkeypatch, f)
+        c = DeepSeekRisk()
+        c._cf_client = MagicMock()
+        c._cf_client.chat_completion = MagicMock(return_value=_cf_resp(RISK_GOOD))
+        r = c.evaluate_raw("s", "u", bar_ts=1)
+        assert r.error is None and r.model_used == CF_MODELS[0]
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: breaker semantics
+# ---------------------------------------------------------------------------
+
+class TestBreakerSemantics:
+    @pytest.mark.parametrize("between", [
+        status(429),
+        status(400),
+        status(401),
+        status(404),
+        status(500),
+        status(503),
+        ok(RISK_GOOD),
+        ok({"approved": True}),          # 200, bad schema
+        ok("not json"),
+        ok(""),
+    ], ids=["429", "400", "401", "404", "500", "503", "200-ok", "200-schema", "200-parse", "200-empty"])
+    def test_any_response_between_two_timeouts_resets_the_count(self, between):
+        client, post, clock = install(
+            {GPT: [httpx.ReadTimeout("t"), between, httpx.ReadTimeout("t"), ok(RISK_GOOD)]})
+        assert client.complete(SPEC, "s", "u", RISK_KEYS).error == "timeout"
+        client.complete(SPEC, "s", "u", RISK_KEYS)
+        clock.advance(60)                # clear a 429 cooldown
+        assert client.complete(SPEC, "s", "u", RISK_KEYS).error == "timeout"
+        assert client.guard.acquire(GPT) is None, "two timeouts were not consecutive"
+
+    def test_two_timeouts_in_a_row_still_trip(self):
+        client, post, clock = install({GPT: [httpx.ReadTimeout("t")]})
+        client.complete(SPEC, "s", "u")
+        client.complete(SPEC, "s", "u")
+        assert client.guard.acquire(GPT) == "breaker"
+
+    @pytest.mark.parametrize("trip", [
+        httpx.ReadTimeout("t"), httpx.ConnectTimeout("t"), httpx.ConnectError("x"),
+        status(502), status(504), status(529),
+    ], ids=["read-timeout", "connect-timeout", "connect-error", "502", "504", "529"])
+    def test_mixed_tripping_failures_count_together(self, trip):
+        client, post, clock = install({GPT: [httpx.ReadTimeout("t"), trip]})
+        client.complete(SPEC, "s", "u")
+        client.complete(SPEC, "s", "u")
+        assert client.guard.acquire(GPT) == "breaker"
+
+    @pytest.mark.parametrize("code", [500, 501, 503, 505, 507, 598])
+    def test_other_5xx_never_trips(self, code):
+        client, post, clock = install({GPT: [status(code)]})
+        for _ in range(6):
+            res = client.complete(SPEC, "s", "u")
+            assert res.error == "http_5xx" and res.skipped is None
+        assert len(post.calls) == 6
+        assert client.guard.stats()["failures"] == {"http_5xx": 6}
+
+    def test_other_5xx_between_tripping_failures_resets(self):
+        client, post, clock = install(
+            {GPT: [status(502), status(503), status(504), status(529)]})
+        for _ in range(3):
+            client.complete(SPEC, "s", "u")
+        assert client.guard.acquire(GPT) is None     # 502 / 503 / 504 are not consecutive
+        client.guard.record_failure(GPT, "5xx")      # 504 + this one: now they are
+        assert client.guard.acquire(GPT) == "breaker"
+
+    def test_200_with_bad_schema_is_logged_as_schema_failure_with_no_breaker_effect(self, caplog):
+        client, post, clock = install({GPT: [httpx.ReadTimeout("t"), ok({"approved": True}),
+                                              httpx.ReadTimeout("t")]})
+        client.complete(SPEC, "s", "u", RISK_KEYS)
+        with caplog.at_level(logging.WARNING, logger="src.llm.nim"):
+            assert client.complete(SPEC, "s", "u", RISK_KEYS).error == "schema"
+        assert any("schema" in r.getMessage() for r in caplog.records)
+        assert client.guard.stats()["failures"] == {"timeout": 1, "schema": 1}
+        client.complete(SPEC, "s", "u", RISK_KEYS)
+        assert client.guard.acquire(GPT) is None
+
+    def test_unexpected_local_error_is_not_a_response_and_does_not_reset(self):
+        client, post, clock = install({GPT: [httpx.ReadTimeout("t"), RuntimeError("x"),
+                                              httpx.ReadTimeout("t")]})
+        for _ in range(3):
+            client.complete(SPEC, "s", "u")
+        assert client.guard.acquire(GPT) == "breaker"
+
+    def test_half_open_still_lets_exactly_one_probe_through(self):
+        client, post, clock = install({GPT: [httpx.ReadTimeout("t")]})
+        client.complete(SPEC, "s", "u")
+        client.complete(SPEC, "s", "u")
+        clock.advance(15 * 60 - 1)
+        assert client.guard.acquire(GPT) == "breaker"
+        clock.advance(2)
+        assert client.guard.acquire(GPT) is None
+        for _ in range(3):
+            assert client.guard.acquire(GPT) == "breaker"
+
+    def test_non_tripping_answer_to_the_probe_keeps_it_half_open(self):
+        client, post, clock = install({GPT: [httpx.ReadTimeout("t"), httpx.ReadTimeout("t"),
+                                              status(400), httpx.ReadTimeout("t")]})
+        client.complete(SPEC, "s", "u")
+        client.complete(SPEC, "s", "u")
+        clock.advance(15 * 60 + 1)
+        assert client.complete(SPEC, "s", "u").error == "http_4xx"    # probe answered, not "up"
+        assert client.complete(SPEC, "s", "u").error == "timeout"     # so next call is the probe
+        assert client.guard.acquire(GPT) == "breaker"                 # which failed: re-opened
+
+
+# ---------------------------------------------------------------------------
+# Fix 5: shadow isolation
+# ---------------------------------------------------------------------------
+
+class TestShadowIsolation:
+    def test_admission_boundary_is_ten_free_slots(self):
+        g = NimGuard(clock=FakeClock())
+        for _ in range(20):
+            assert g.acquire(GPT) is None
+        assert g.acquire(GPT, shadow=True) is None           # 20 used -> 10 free -> admitted
+        assert g.acquire(GPT, shadow=True) == "shadow"       # 21 used
+        assert g.stats()["shadow_skipped"] == 1
+        assert g.stats()["skipped_ratelimit"] == 0
+
+    def test_window_slides_for_shadow_too(self):
+        clock = FakeClock()
+        g = NimGuard(clock=clock)
+        for _ in range(25):
+            g.acquire(GPT)
+        assert g.acquire(GPT, shadow=True) == "shadow"
+        clock.advance(61)
+        assert g.acquire(GPT, shadow=True) is None
+
+    def test_shadow_refused_in_cooldown_or_open_breaker_or_half_open(self):
+        clock = FakeClock()
+        g = NimGuard(clock=clock)
+        g.record_rate_limited(GPT, None)
+        assert g.acquire(GPT, shadow=True) == "shadow"
+        clock.advance(31)
+        assert g.acquire(GPT, shadow=True) is None
+        for _ in range(2):
+            g.acquire(GPT); g.record_failure(GPT, "timeout")
+        assert g.acquire(GPT, shadow=True) == "shadow"        # open
+        clock.advance(15 * 60 + 1)
+        assert g.acquire(GPT, shadow=True) == "shadow"        # half-open: the probe is for real calls
+        assert g.acquire(GPT) is None                         # ...and the probe is still available
+
+    def test_shadow_failures_do_not_increment_the_breaker(self):
+        client, post, clock = install({GPT: [httpx.ReadTimeout("t")]})
+        for _ in range(5):
+            assert client.complete(SPEC, "s", "u", shadow=True).error == "timeout"
+        assert client.guard.acquire(GPT) is None              # real traffic untouched
+        assert client.guard.stats()["failures"] == {"timeout": 5}
+        client.guard.record_failure(GPT, "timeout")           # one real failure: still not tripped
+        assert client.guard.acquire(GPT) is None
+
+    @pytest.mark.parametrize("answer", [ok(STRUCT_SHADOW), ok({"trend": "up"}), status(400),
+                                        status(503), ok("garbage")],
+                             ids=["200", "schema", "400", "503", "parse"])
+    def test_shadow_outcomes_do_not_reset_the_breaker(self, answer):
+        client, post, clock = install({GPT: [answer]})
+        client.guard.acquire(GPT)
+        client.guard.record_failure(GPT, "timeout")           # real: 1 consecutive
+        client.complete(SPEC, "s", "u", {"trend", "structural_signal"}, shadow=True)
+        assert len(post.calls) == 1
+        client.guard.acquire(GPT)
+        client.guard.record_failure(GPT, "timeout")           # real: 2nd -> must trip
+        assert client.guard.acquire(GPT) == "breaker"
+
+    def test_shadow_success_does_not_close_an_open_breaker_or_use_the_probe(self):
+        client, post, clock = install({GPT: [ok(STRUCT_SHADOW)]})
+        for _ in range(2):
+            client.guard.acquire(GPT); client.guard.record_failure(GPT, "timeout")
+        clock.advance(15 * 60 + 1)
+        assert client.complete(SPEC, "s", "u", shadow=True).skipped == "shadow"
+        assert post.calls == []
+        assert client.guard.acquire(GPT) is None              # the probe is still there
+
+    def test_shadow_429_still_sets_the_global_cooldown(self):
+        client, post, clock = install({GPT: [status(429, **{"retry-after": "50"})]})
+        assert client.complete(SPEC, "s", "u", shadow=True).error == "429"
+        assert client.guard.acquire(GLM) == "cooldown"
+        clock.advance(49)
+        assert client.guard.acquire(GLM) == "cooldown"
+        clock.advance(2)
+        assert client.guard.acquire(GLM) is None
+
+    def test_shadow_429_does_not_touch_the_breaker_count(self):
+        client, post, clock = install({GPT: [status(429)]})
+        client.guard.acquire(GPT)
+        client.guard.record_failure(GPT, "timeout")
+        client.complete(SPEC, "s", "u", shadow=True)
+        clock.advance(31)
+        client.guard.acquire(GPT)
+        client.guard.record_failure(GPT, "timeout")
+        assert client.guard.acquire(GPT) == "breaker"
+
+    def test_skipped_shadow_is_silent(self, caplog):
+        client, post, clock = install({GPT: [ok(STRUCT_SHADOW)]})
+        fill_window(client, 25)
+        with caplog.at_level(logging.INFO, logger="src.llm.nim"):
+            res = client.complete(SPEC, "s", "u", shadow=True)
+        assert res.skipped == "shadow"
+        assert not [r for r in caplog.records if r.levelno >= logging.INFO]
+
+    def test_shadow_never_changes_the_real_chain_choice(self):
+        """Window at 20: the shadow takes the 21st slot, times out, and is then
+        refused. Real decisions keep the remaining 9 slots and gpt-oss stays the
+        first choice (its breaker never saw the shadow's timeout)."""
+        from src.llm.haiku_structural import HaikuStructural
+        client, post, clock = install({GPT: [httpx.ReadTimeout("t")]})
+        fill_window(client, 20)
+        c = HaikuStructural(api_key="test-key-redacted")
+        c._db = RecordingDB()
+        with patch.object(c._client.messages, "create", side_effect=Exception("down")),                 patch("src.llm.haiku_structural.sdk_available", return_value=False):
+            for _ in range(4):
+                c.evaluate(_snapshot(), bar_ts=1)
+        assert post.models == [GPT]                             # one shadow call, rest refused
+        s = client.guard.stats()
+        assert s["shadow_skipped"] == 3 and s["failures"] == {"timeout": 1}
+        for _ in range(9):
+            assert client.guard.acquire(GPT) is None            # breaker closed, slots left
+        assert client.guard.acquire(GPT) == "ratelimit"
+
+
+# ---------------------------------------------------------------------------
+# Fix 6: timeouts on the non-NIM clients
+# ---------------------------------------------------------------------------
+
+class TestClientTimeouts:
+    def test_cloudflare_client_gets_a_30s_timeout(self, monkeypatch):
+        from src.llm import cf
+        monkeypatch.setattr(cf, "CF_ACCOUNT_ID", "acct")
+        monkeypatch.setattr(cf, "CF_API_TOKEN", "tok")
+        with patch.object(cf, "InferenceClient") as ic:
+            assert cf.make_cf_client("test") is ic.return_value
+        assert ic.call_args.kwargs["timeout"] == 30.0
+
+    def test_cloudflare_timeout_is_accepted_by_the_installed_signature(self):
+        import inspect
+        from huggingface_hub import InferenceClient
+        assert "timeout" in inspect.signature(InferenceClient.__init__).parameters
+        c = InferenceClient(base_url="http://x.invalid/v1", token="t", timeout=30.0)
+        assert c.timeout == 30.0
+
+    def test_gemini_client_gets_a_120s_http_timeout(self):
+        from src.llm import gemini_execution as ge
+        with patch.object(ge.genai, "Client") as client_cls:
+            ge.GeminiExecution(api_key="test-key-redacted")
+        opts = client_cls.call_args.kwargs["http_options"]
+        assert opts.timeout == 120_000
+
+    def test_gemini_http_options_reach_the_real_client(self):
+        from src.llm.gemini_execution import GeminiExecution
+        c = GeminiExecution(api_key="test-key-redacted")
+        assert c._client._api_client._http_options.timeout == 120_000

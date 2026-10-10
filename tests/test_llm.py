@@ -341,7 +341,10 @@ class TestGeminiExecution:
         assert result.error == "json_parse_failed"
 
     def test_budget_exceeded_no_sdk_call(self):
+        # The pre-call estimate is 0 (the chain starts with free providers), so
+        # the cap only blocks once spend has actually gone over it.
         tracker = CostTracker(cap_usd=0.0)
+        tracker.record(0.01)
         client = self._make_client(tracker=tracker)
         with patch.object(client._client.models, "generate_content") as mock_gen:
             result = client.evaluate_raw("system", "user", bar_ts=12345)

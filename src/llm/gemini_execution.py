@@ -43,6 +43,9 @@ NIM_CHAIN = (
 # Last resort after every Gemini model has failed.
 CF_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
 
+# Per-request HTTP timeout for the google-genai client (HttpOptions.timeout, ms).
+GEMINI_API_TIMEOUT_MS = 120_000
+
 # Chain refreshed 2026-08-30 against the live free-tier model list.
 # gemini-3.7-flash was dropped on 2026-10-10 because Google deprecated it.
 # The Pro entries were dropped earlier: the free tier reports quotaValue 0 for
@@ -99,7 +102,11 @@ class GeminiExecution(LLMClient):
         prompt_path: Optional[Path] = None,
     ) -> None:
         super().__init__(tracker=tracker, db=db, prompt_path=prompt_path or _PROMPT_PATH)
-        self._client = genai.Client(api_key=api_key)
+        # HttpOptions.timeout is in milliseconds; without it a stalled request is unbounded.
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(timeout=GEMINI_API_TIMEOUT_MS),
+        )
         self._last_model = GEMINI_MODELS[-1]  # default to final fallback
         self._cf_client = make_cf_client("gemini")
 
@@ -203,10 +210,12 @@ class GeminiExecution(LLMClient):
         return in_tok * 0.075e-6 + out_tok * 0.30e-6
 
     def _estimated_cost_usd(self, prompt_chars: int) -> float:
-        est_in = prompt_chars / 4
-        est_out = 300
-        # Worst case (Gemini billing), regardless of which provider answered last.
-        return int(est_in) * 0.075e-6 + est_out * 0.30e-6
+        # The budget pre-check runs before any provider is chosen, and this leg's
+        # chain starts with free ones (NIM, then Gemini free tier, then
+        # Cloudflare). Returning a Gemini estimate here would let an exhausted
+        # budget block calls that cost nothing; the real cost is still recorded
+        # after the call by _actual_cost_usd.
+        return 0.0
 
     def evaluate(
         self,

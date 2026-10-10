@@ -27,7 +27,7 @@ _PROMPT_PATH = Path(__file__).parent / "prompts" / "structural.txt"
 # Shadow-only NIM model. No NIM model matched the production structural output
 # in /root/nim-bench (signal agreement at best 3/8), so the decision stays on
 # Claude; gpt-oss-20b runs alongside purely so the two can be compared later.
-SHADOW_SPEC = nim.NimSpec(nim.GPT_OSS_20B, 15.0)
+SHADOW_SPEC = nim.NimSpec(nim.GPT_OSS_20B, 15.0)   # hard wall-clock cap, see nim._http_post
 SHADOW_LABEL = f"nim-shadow:{nim.GPT_OSS_20B}"
 
 
@@ -146,13 +146,17 @@ class HaikuStructural(LLMClient):
     def _run_shadow(self, system: str, user: str, bar_ts: int) -> None:
         """Log what NIM gpt-oss-20b would have said about this bar. Observation
         only: the result is never returned or used, it runs after the production
-        call, it is bounded by SHADOW_SPEC.timeout, it is skipped when the shared
-        NIM guard says NIM is unavailable, and nothing it does can raise."""
+        call, it is bounded by a hard SHADOW_SPEC.timeout deadline, and nothing it
+        does can raise. It must not change which provider a real decision uses:
+        the guard admits it only while the limiter window has spare room, NIM is
+        not cooling down and gpt-oss's breaker is closed (otherwise it is
+        skipped and counted as shadow_skipped), and its outcomes never feed the
+        per-model breaker (a 429 still sets the global cooldown)."""
         try:
             client = nim.get_client()
             if client is None or self._db is None:
                 return
-            res = client.complete(SHADOW_SPEC, system, user, self.schema_keys)
+            res = client.complete(SHADOW_SPEC, system, user, self.schema_keys, shadow=True)
             if res.skipped:
                 return
             parsed = parse_json_strict(res.raw) if res.ok else None
