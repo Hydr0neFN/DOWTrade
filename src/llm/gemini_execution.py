@@ -26,16 +26,13 @@ log = logging.getLogger(__name__)
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "execution.txt"
 
 # Chain refreshed 2026-08-30 against the live free-tier model list.
-# 3.6 leads because 3.7 is heavily rate-limited on the free tier: measured 1 of 5
-# calls succeeding, the rest returning "experiencing high demand". A separate
-# benchmark found the two indistinguishable in answer quality, so the reliable one
-# goes first and 3.7 stays as an opportunistic second. The Pro entries
-# were dropped: the free tier reports quotaValue 0 for gemini-3.1-pro (seen in this
-# bot's own logs) and gemini-3-pro-preview is no longer listed, so both only ever
-# cost a 429 and a retry delay before the chain moved on.
+# gemini-3.7-flash was dropped on 2026-10-10 because Google deprecated it.
+# The Pro entries were dropped earlier: the free tier reports quotaValue 0 for
+# gemini-3.1-pro (seen in this bot's own logs) and gemini-3-pro-preview is no
+# longer listed, so both only ever cost a 429 and a retry delay before the chain
+# moved on.
 GEMINI_MODELS = [
     "gemini-3.6-flash",
-    "gemini-3.7-flash",
     "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
     "gemini-3-flash-preview",
@@ -49,7 +46,7 @@ GEMINI_CLI_PATH    = os.environ.get("GEMINI_CLI_PATH", "/usr/bin/gemini")
 # When Pro quota exhausts, the loop drops to Flash automatically (separate quota).
 # Override with GEMINI_CLI_MODELS env var (comma-separated). Singular
 # GEMINI_CLI_MODEL still respected for backward compat.
-_default_cli_chain = "gemini-3.6-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-2.5-flash"
+_default_cli_chain = "gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-2.5-flash"
 _legacy_single = os.environ.get("GEMINI_CLI_MODEL")
 GEMINI_CLI_MODELS = [
     m.strip() for m in os.environ.get("GEMINI_CLI_MODELS", _legacy_single or _default_cli_chain).split(",")
