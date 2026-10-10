@@ -47,14 +47,14 @@ CF_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
 GEMINI_API_TIMEOUT_MS = 120_000
 
 # Chain refreshed 2026-08-30 against the live free-tier model list.
-# gemini-3.7-flash was dropped on 2026-10-10 because Google deprecated it.
+# gemini-3.7-flash (2026-10-10) and gemini-3.5-flash (2026-10-11) were dropped
+# because Google deprecated them.
 # The Pro entries were dropped earlier: the free tier reports quotaValue 0 for
 # gemini-3.1-pro (seen in this bot's own logs) and gemini-3-pro-preview is no
 # longer listed, so both only ever cost a 429 and a retry delay before the chain
 # moved on.
 GEMINI_MODELS = [
     "gemini-3.6-flash",
-    "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
     "gemini-3-flash-preview",
     "gemini-2.5-flash",
@@ -67,7 +67,7 @@ GEMINI_CLI_PATH    = os.environ.get("GEMINI_CLI_PATH", "/usr/bin/gemini")
 # When Pro quota exhausts, the loop drops to Flash automatically (separate quota).
 # Override with GEMINI_CLI_MODELS env var (comma-separated). Singular
 # GEMINI_CLI_MODEL still respected for backward compat.
-_default_cli_chain = "gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-2.5-flash"
+_default_cli_chain = "gemini-3.6-flash,gemini-3-flash-preview,gemini-2.5-flash"
 _legacy_single = os.environ.get("GEMINI_CLI_MODEL")
 GEMINI_CLI_MODELS = [
     m.strip() for m in os.environ.get("GEMINI_CLI_MODELS", _legacy_single or _default_cli_chain).split(",")
