@@ -40,7 +40,12 @@ NIM_CHAIN = (
     nim.NimSpec(nim.NEMOTRON_SUPER, 8.0),
 )
 
-# Last resort after every Gemini model has failed.
+# Self-hosted gpt-oss-20b (p50 ~4 s on this prompt), tried only once every Gemini
+# model has failed: Gemini stays ahead of it because it is the historical
+# reference for this leg. Skipped at once when the box is down or has no key.
+LOCAL_CHAIN = (nim.NimSpec(nim.LOCAL_GPT_OSS_20B, 25.0, provider="local"),)
+
+# Last resort after the local model has failed too.
 CF_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
 
 # Per-request HTTP timeout for the google-genai client (HttpOptions.timeout, ms).
@@ -150,14 +155,20 @@ class GeminiExecution(LLMClient):
         raise RuntimeError(f"All CLI models failed: {last_exc}")
 
     def _call(self, system: str, user: str) -> Tuple[str, int, int]:
-        """NIM chain, then Gemini, then Cloudflare as the last resort."""
+        """NIM chain, then Gemini, then the local model, then Cloudflare as the last resort."""
         res = nim.run_chain(NIM_CHAIN, system, user, self.schema_keys)
         if res is not None:
-            self._last_model = f"nim:{res.model}"
+            self._last_model = res.label
             return res.raw, res.in_tok, res.out_tok
         try:
             return self._call_gemini(system, user)
         except Exception as gemini_exc:
+            res = nim.run_chain(LOCAL_CHAIN, system, user, self.schema_keys)
+            if res is not None:
+                log.warning("[gemini] all Gemini models failed (%s) -- answered by %s",
+                            str(gemini_exc)[:80], res.label)
+                self._last_model = res.label
+                return res.raw, res.in_tok, res.out_tok
             if self._cf_client is None:
                 raise
             try:
@@ -201,10 +212,10 @@ class GeminiExecution(LLMClient):
         raise RuntimeError(f"All Gemini models failed: {last_exc}")
 
     def _actual_cost_usd(self, in_tok: int, out_tok: int) -> float:
-        # NIM free tier and Cloudflare's free allowance cost nothing; billing them
+        # NIM free tier, the self-hosted model and Cloudflare's free allowance cost nothing; billing them
         # at the Gemini placeholder would walk the shared CostTracker toward
         # MAX_LLM_SPEND_USD over spend that never happened.
-        if self._last_model.startswith(("nim:", "@cf/")):
+        if self._last_model.startswith(("nim:", "local:", "@cf/")):
             return 0.0
         # Gemini 2.5 Flash pricing placeholder: $0.075/M input, $0.30/M output
         return in_tok * 0.075e-6 + out_tok * 0.30e-6
@@ -212,7 +223,7 @@ class GeminiExecution(LLMClient):
     def _estimated_cost_usd(self, prompt_chars: int) -> float:
         # The budget pre-check runs before any provider is chosen, and this leg's
         # chain starts with free ones (NIM, then Gemini free tier, then
-        # Cloudflare). Returning a Gemini estimate here would let an exhausted
+        # the local model and Cloudflare). Returning a Gemini estimate here would let an exhausted
         # budget block calls that cost nothing; the real cost is still recorded
         # after the call by _actual_cost_usd.
         return 0.0

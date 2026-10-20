@@ -19,7 +19,10 @@ def _nim_disabled_by_default(monkeypatch):
     """
     from src.llm import nim
     monkeypatch.delenv(nim.KEY_ENV, raising=False)
+    monkeypatch.delenv(nim.LOCAL_KEY_ENV, raising=False)
     nim.set_client(None)
+    nim.set_local_client(None)       # the box has a real ~/.local-llm-key too
     nim.GUARD.clear()
+    nim.LOCAL_GUARD.clear()
     yield
     nim.reset()

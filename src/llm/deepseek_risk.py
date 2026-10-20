@@ -29,9 +29,13 @@ _PROMPT_PATH = Path(__file__).parent / "prompts" / "risk_audit.txt"
 
 # NIM models, picked from /root/nim-bench: on the risk-audit prompt gpt-oss-20b
 # and glm-5.3-flash both caught 18/18 true violations with no false positives,
-# against 9/18 for Cloudflare mistral-small and 10/18 for llama-4-scout.
+# against 9/18 for Cloudflare mistral-small and 10/18 for llama-4-scout. The
+# self-hosted gpt-oss-20b (same weights as NIM's, 18/18 and no false positives on
+# the bot's real prompts, p50 ~8 s) sits between them: it is only reached when NIM
+# gpt-oss failed, and it degrades silently when the box is down.
 NIM_CHAIN = (
     nim.NimSpec(nim.GPT_OSS_20B, 20.0),
+    nim.NimSpec(nim.LOCAL_GPT_OSS_20B, 25.0, provider="local"),
     nim.NimSpec(nim.GLM_FLASH, 25.0),
 )
 
@@ -77,7 +81,7 @@ class DeepSeekRisk(LLMClient):
         """NIM chain, then the Cloudflare models; fall through on any failure."""
         res = nim.run_chain(NIM_CHAIN, system, user, self.schema_keys)
         if res is not None:
-            self._last_model = f"nim:{res.model}"
+            self._last_model = res.label
             return res.raw, res.in_tok, res.out_tok
         last_exc = None
         if self._cf_client is not None:
@@ -92,8 +96,8 @@ class DeepSeekRisk(LLMClient):
         raise RuntimeError(f"All risk-audit models failed: {last_exc or 'no provider available'}")
 
     def _actual_cost_usd(self, in_tok: int, out_tok: int) -> float:
-        # Every provider left in the chain is free (NIM free tier, Cloudflare's
-        # daily Neuron allowance). Charging a placeholder would walk the shared
+        # Every provider left in the chain is free (NIM free tier, the self-hosted
+        # llama-server, Cloudflare's daily Neuron allowance). Charging a placeholder would walk the shared
         # CostTracker toward MAX_LLM_SPEND_USD over spend that never happened.
         return 0.0
 

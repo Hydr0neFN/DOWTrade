@@ -29,6 +29,14 @@ There are no retries anywhere: every failure falls through at once. Without a
 key (env NVIDIA_NIM_API_KEY, else ~/.nvidia-nim-key) NIM is disabled and the
 callers behave exactly as they did before NIM existed. The key is only ever put
 in the Authorization header; nothing here logs it.
+
+A self-hosted llama-server (OpenAI-compatible, over Tailscale) can sit in a
+chain as a NimSpec with provider="local". It is a fallback that may be down for
+hours, so it has its own client and its own NimGuard (its own window, 429
+cooldown and breakers, which stay open 5 min instead of 15): it never uses up
+NIM's request window, and a NIM cooldown or full window skips only the NIM specs
+of a chain, never the local ones. Key: env LOCAL_LLM_API_KEY, else
+~/.local-llm-key; without one local is disabled and its specs are skipped.
 """
 from __future__ import annotations
 
@@ -53,21 +61,35 @@ NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 KEY_ENV = "NVIDIA_NIM_API_KEY"
 KEY_FILE = Path.home() / ".nvidia-nim-key"
 
+# Self-hosted llama-server (see the module docstring).
+LOCAL_URL = os.environ.get("LOCAL_LLM_URL", "").strip() or "http://100.119.161.52:8097/v1/chat/completions"
+LOCAL_KEY_ENV = "LOCAL_LLM_API_KEY"
+LOCAL_KEY_FILE = Path.home() / ".local-llm-key"
+
 GPT_OSS_20B = "openai/gpt-oss-20b"
 GLM_FLASH = "z-ai/glm-5.3-flash"
 NEMOTRON_SUPER = "nvidia/nemotron-3-super-120b-a12b"
+LOCAL_GPT_OSS_20B = "gpt-oss-20b"      # same MXFP4 weights NIM serves, on llama-server
 
 # Per-model request settings, taken from the benchmark in /root/nim-bench.
 #   gpt-oss-20b : reasoning kept at "low"; the default burns the whole budget on
 #                 reasoning and leaves `content` empty.
 #   glm-5.3-flash: reasoning cannot be switched off, so it needs headroom.
 #   nemotron-3-super: thinking off makes it a ~1 s answer instead of an empty one.
+#   local gpt-oss-20b: llama-server wants the effort twice (top level and in the
+#                 chat template kwargs); the answer is in `content`, the reasoning
+#                 arrives separately in `reasoning_content` and is ignored.
 _MODEL_SETTINGS = {
     GPT_OSS_20B: {"max_tokens": 1024, "reasoning_effort": "low"},
     GLM_FLASH: {"max_tokens": 2048},
     NEMOTRON_SUPER: {
         "max_tokens": 1024,
         "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
+    },
+    LOCAL_GPT_OSS_20B: {
+        "max_tokens": 1024,
+        "reasoning_effort": "low",
+        "chat_template_kwargs": {"reasoning_effort": "low"},
     },
 }
 
@@ -78,6 +100,11 @@ COOLDOWN_429_SEC = 30.0
 COOLDOWN_429_MAX_SEC = 120.0
 BREAKER_THRESHOLD = 2
 BREAKER_OPEN_SEC = 15 * 60.0
+
+# The self-hosted box: its own window (it only has to protect itself) and a
+# shorter breaker, since it comes back as soon as a benchmark run ends.
+LOCAL_MAX_REQUESTS = 60
+LOCAL_BREAKER_OPEN_SEC = 5 * 60.0
 
 # The shadow call is admitted only while the window holds at most this many
 # requests, i.e. it always leaves >= NIM_MAX_REQUESTS - SHADOW_MAX_USED slots free
@@ -101,9 +128,11 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 @dataclass(frozen=True)
 class NimSpec:
-    """One model in a leg's chain, with that leg's hard timeout for it."""
+    """One model in a leg's chain, with that leg's hard timeout for it.
+    provider is "nim" or "local" (the self-hosted endpoint)."""
     model: str
     timeout: float
+    provider: str = "nim"
 
 
 @dataclass
@@ -115,10 +144,16 @@ class NimResult:
     latency_ms: int = 0
     error: Optional[str] = None        # failure kind; None on success
     skipped: Optional[str] = None      # "cooldown" | "ratelimit" | "breaker" | "shadow"; no request was made
+    provider: str = "nim"              # set by run_chain from the spec that answered
 
     @property
     def ok(self) -> bool:
         return self.error is None and self.skipped is None
+
+    @property
+    def label(self) -> str:
+        """What the legs log as the model that answered, e.g. "nim:openai/gpt-oss-20b"."""
+        return f"{self.provider}:{self.model}"
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +175,10 @@ class NimGuard:
         clock: Callable[[], float] = time.monotonic,
         max_requests: int = NIM_MAX_REQUESTS,
         window_sec: float = NIM_WINDOW_SEC,
+        breaker_open_sec: float = BREAKER_OPEN_SEC,
     ) -> None:
         self._clock = clock
+        self._open_sec = breaker_open_sec
         self._max = max_requests
         self._window = window_sec
         self._lock = threading.Lock()
@@ -218,9 +255,9 @@ class NimGuard:
             was_probe = b.probing
             b.probing = False
             if b.fails >= BREAKER_THRESHOLD or was_probe:
-                b.open_until = self._clock() + BREAKER_OPEN_SEC
+                b.open_until = self._clock() + self._open_sec
                 log.info("[nim] breaker OPEN for %s: %d consecutive failures (last=%s), "
-                         "skipping for %.0f min", model, b.fails, kind, BREAKER_OPEN_SEC / 60)
+                         "skipping for %.0f min", model, b.fails, kind, self._open_sec / 60)
 
     def record_other_failure(self, model: str, kind: str, shadow: bool = False,
                              got_response: bool = True) -> None:
@@ -282,10 +319,10 @@ class NimGuard:
             self._counts.clear()
             self._failures.clear()
 
-    def summary_line(self) -> str:
+    def summary_line(self, label: str = "NIM") -> str:
         s = self.stats()
         fails = ",".join(f"{k}={v}" for k, v in sorted(s["failures"].items())) or "none"
-        return (f"NIM stats: calls={s['calls']} skipped_ratelimit={s['skipped_ratelimit']} "
+        return (f"{label} stats: calls={s['calls']} skipped_ratelimit={s['skipped_ratelimit']} "
                 f"skipped_breaker={s['skipped_breaker']} skipped_cooldown={s['skipped_cooldown']} "
                 f"shadow_skipped={s['shadow_skipped']} failures={fails}")
 
@@ -336,8 +373,10 @@ class NimClient:
         api_key: str,
         guard: Optional[NimGuard] = None,
         post: Optional[Callable] = None,
+        url: Optional[str] = None,
     ) -> None:
         self._headers = {"Authorization": "Bearer " + api_key}
+        self._url = url                     # None = NIM_URL, looked up per request
         self.guard = guard or GUARD
         self._post = post or self._http_post
         self._http: Optional[httpx.Client] = None
@@ -437,7 +476,7 @@ class NimClient:
             return NimResult(model, latency_ms=ms, error=kind)
 
         try:
-            resp = self._post(NIM_URL, self._headers, body, spec.timeout)
+            resp = self._post(self._url or NIM_URL, self._headers, body, spec.timeout)
         except httpx.TimeoutException:
             self.guard.record_failure(model, "timeout", shadow=shadow)
             return fail("timeout")
@@ -451,7 +490,7 @@ class NimClient:
         status = resp.status_code
         if status == 429:
             wait = self.guard.record_rate_limited(model, _retry_after(resp), shadow=shadow)
-            log.warning("[nim] HTTP 429 -- NIM unavailable for %.0f s", wait)
+            log.warning("[nim] HTTP 429 from %s -- provider unavailable for %.0f s", model, wait)
             return fail("429")
         if status in BREAKER_STATUSES:
             self.guard.record_failure(model, "5xx", shadow=shadow)
@@ -510,28 +549,42 @@ class NimClient:
 # ---------------------------------------------------------------------------
 
 GUARD = NimGuard()
+LOCAL_GUARD = NimGuard(max_requests=LOCAL_MAX_REQUESTS, breaker_open_sec=LOCAL_BREAKER_OPEN_SEC)
 
 _client_lock = threading.Lock()
 _client: Optional[NimClient] = None
 _resolved = False
+_local_client: Optional[NimClient] = None
+_local_resolved = False
 
 
-def _load_key() -> str:
-    """The API key, or "" when there is none or it is unusable. Never raises."""
-    key = os.environ.get(KEY_ENV, "").strip()
+def _read_key(env: str, path, label: str) -> str:
+    """The API key from `env`, else from the file `path`; "" when there is none
+    or it is unusable. Never raises."""
+    key = os.environ.get(env, "").strip()
     if not key:
         try:
-            key = KEY_FILE.read_text().strip()
+            key = path.read_text().strip()
         except FileNotFoundError:
             return ""
         except (OSError, ValueError) as exc:    # unreadable, or not valid text (UnicodeDecodeError)
-            log.warning("[nim] cannot read %s (%s) -- NIM disabled", KEY_FILE, type(exc).__name__)
+            log.warning("[nim] cannot read %s (%s) -- %s disabled", path, type(exc).__name__, label)
             return ""
     if key and not (key.isascii() and key.isprintable() and " " not in key):
         # Would make every request fail while building the Authorization header.
-        log.warning("[nim] API key has non-ASCII / control / space characters -- NIM disabled")
+        log.warning("[nim] API key has non-ASCII / control / space characters -- %s disabled", label)
         return ""
     return key
+
+
+def _load_key() -> str:
+    """The NIM API key, or "" when there is none or it is unusable. Never raises."""
+    return _read_key(KEY_ENV, KEY_FILE, "NIM")
+
+
+def _load_local_key() -> str:
+    """The local endpoint's API key, or "" (see _read_key)."""
+    return _read_key(LOCAL_KEY_ENV, LOCAL_KEY_FILE, "local LLM")
 
 
 def get_client() -> Optional[NimClient]:
@@ -561,12 +614,41 @@ def set_client(client: Optional[NimClient]) -> None:
         _client, _resolved = client, True
 
 
+def get_local_client() -> Optional[NimClient]:
+    """The shared client for the self-hosted endpoint, or None when it is
+    disabled (no usable key). Resolved once per process, like get_client()."""
+    global _local_client, _local_resolved
+    with _client_lock:
+        if not _local_resolved:
+            try:
+                key = _load_local_key()
+            except Exception as exc:            # _load_local_key is meant not to raise; never retry if it does
+                log.warning("[nim] local key loading failed (%s) -- local LLM disabled", type(exc).__name__)
+                key = ""
+            _local_client = NimClient(key, guard=LOCAL_GUARD, url=LOCAL_URL) if key else None
+            _local_resolved = True
+            if _local_client is None:
+                log.info("[nim] local LLM disabled (no usable %s / %s)", LOCAL_KEY_ENV, LOCAL_KEY_FILE)
+            else:
+                log.info("[nim] local LLM enabled (%s)", LOCAL_URL)
+        return _local_client
+
+
+def set_local_client(client: Optional[NimClient]) -> None:
+    """Install (or, with None, disable) the local-endpoint client. For tests."""
+    global _local_client, _local_resolved
+    with _client_lock:
+        _local_client, _local_resolved = client, True
+
+
 def reset() -> None:
-    """Forget the resolved client and clear guard state. For tests."""
-    global _client, _resolved
+    """Forget the resolved clients and clear guard state. For tests."""
+    global _client, _resolved, _local_client, _local_resolved
     with _client_lock:
         _client, _resolved = None, False
+        _local_client, _local_resolved = None, False
     GUARD.clear()
+    LOCAL_GUARD.clear()
 
 
 def stats() -> dict:
@@ -577,6 +659,12 @@ def summary_and_reset() -> str:
     """One-line usage summary since the last call (for the daily log), then zero it."""
     line = GUARD.summary_line()
     GUARD.reset_stats()
+    with _client_lock:
+        local_on = _local_client is not None
+    s = LOCAL_GUARD.stats()
+    if local_on or any(v for k, v in s.items() if k != "shadow_skipped"):
+        line += " | " + LOCAL_GUARD.summary_line("local")
+    LOCAL_GUARD.reset_stats()
     return line
 
 
@@ -586,23 +674,34 @@ def run_chain(
     user: str,
     schema_keys: Optional[set] = None,
 ) -> Optional[NimResult]:
-    """Try each NIM model in order; the first valid answer wins, else None.
+    """Try each model in order; the first valid answer wins, else None.
 
-    Falls through to the next model on a failure or an open breaker. When the
-    limiter or the 429 cooldown says NIM as a whole is unavailable (or NIM just
-    answered 429) the remaining NIM models are skipped too, since they would be
-    refused for the same reason. Never raises.
+    Each spec goes to the client of its provider ("nim" or "local"); a spec whose
+    provider is disabled (no key) is skipped. Falls through to the next model on
+    a failure or an open breaker. When the limiter or the 429 cooldown says a
+    provider as a whole is unavailable (or it just answered 429) that provider's
+    remaining models are skipped too, since they would be refused for the same
+    reason; the other provider's models still run. Never raises.
     """
     try:
-        client = get_client()
-        if client is None:
-            return None
+        clients: dict = {}
+        down: set = set()
         for spec in specs:
+            provider = "local" if spec.provider == "local" else "nim"
+            if provider in down:
+                continue
+            if provider not in clients:     # resolved lazily: a NIM-only chain never touches local
+                clients[provider] = get_local_client() if provider == "local" else get_client()
+            client = clients[provider]
+            if client is None:
+                down.add(provider)
+                continue
             res = client.complete(spec, system, user, schema_keys)
             if res.ok:
+                res.provider = provider
                 return res
             if res.skipped in ("ratelimit", "cooldown") or res.error == "429":
-                break
+                down.add(provider)
         return None
     except Exception as exc:   # NIM must never take down a leg: the caller falls through to its other providers
         log.warning("[nim] chain failed (%s: %s) -- falling through to the next provider",

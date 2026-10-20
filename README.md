@@ -46,7 +46,8 @@ config file can override the rails in `src/config.py`.
   NVIDIA NIM (free tier) before anything else; the provider that answered is stored
   in `llm_calls.model` with a `nim:` prefix (cost 0, so it never counts toward
   `MAX_LLM_SPEND_USD`).
-  - Risk audit: NIM `openai/gpt-oss-20b` (20 s) -> NIM `z-ai/glm-5.3-flash` (25 s) ->
+  - Risk audit: NIM `openai/gpt-oss-20b` (20 s) -> self-hosted `gpt-oss-20b` (25 s,
+    logged as `local:gpt-oss-20b`) -> NIM `z-ai/glm-5.3-flash` (25 s) ->
     Cloudflare `@cf/meta/llama-4-scout-17b-16e-instruct` ->
     Cloudflare `@cf/mistralai/mistral-small-3.1-24b-instruct`. On the risk-audit
     benchmark (synthetic violations plus real bars) both NIM models flagged 18/18 true violations with no false positives,
@@ -54,6 +55,7 @@ config file can override the rails in `src/config.py`.
     removed: that account has no credit and returned 402 on every call.
   - Execution: NIM `z-ai/glm-5.3-flash` (40 s) -> NIM
     `nvidia/nemotron-3-super-120b-a12b` (8 s) -> the Gemini API chain, unchanged ->
+    self-hosted `gpt-oss-20b` (25 s, `local:gpt-oss-20b`) ->
     Cloudflare mistral-small as a last resort.
   - Structural: unchanged (Sonnet SDK -> Haiku), because no NIM model matched it. A
     **shadow** call to `openai/gpt-oss-20b` (15 s) runs after each production call
@@ -65,6 +67,10 @@ config file can override the rails in `src/config.py`.
     120 s), and a per-model circuit breaker that skips a model for 15 min after 2
     consecutive timeouts / 5xx / connection errors, then lets one probe through. No
     retries: every failure falls through at once.
+  - The self-hosted model (a llama-server reached over Tailscale, same weights as NIM's
+    `gpt-oss-20b`) is a fallback only. It has its own client and guard (`LOCAL_GUARD`: 60
+    requests per 60 s, 5 min breaker), so it never uses NIM's window and a NIM cooldown
+    does not skip it. Zero cost; with no key it is disabled and the legs behave as before.
   - Models that answer in `reasoning` and leave `content` empty cannot satisfy the
     JSON schema; `content` is the only field ever read.
 - **Hard safety layer** — `final_check` enforces max daily loss
@@ -115,6 +121,11 @@ and the `TASTYTRADE_CERT_*` sandbox credentials. See `.env.example`.
 — deliberately not in `.env` or the repo. Without a key NIM is disabled and the
 legs behave as they did before NIM (Gemini for execution, Cloudflare for the risk
 audit).
+
+**Optional — self-hosted LLM fallback.** Put the llama-server key in `LOCAL_LLM_API_KEY`
+or a mode-600 file `~/.local-llm-key` (the URL defaults to the Tailscale address in
+`src/llm/nim.py`; override it with `LOCAL_LLM_URL`). Without a key the local fallback is
+disabled.
 
 **Recommended — Cloudflare Workers AI fallback.** Set `CLOUDFLARE_ACCOUNT_ID` and
 `CLOUDFLARE_API_TOKEN` (the token needs only **Account > Workers AI > Read**) to give
